@@ -1,0 +1,87 @@
+#dtg-warning-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2147483647;
+  font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+  font-size: 14px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.25);
+}
+
+.dtg-inner {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  background: linear-gradient(135deg, #7f1d1d, #991b1b);
+  color: #fff;
+  padding: 14px 18px;
+  border-bottom: 3px solid #fca5a5;
+}
+
+.dtg-icon {
+  font-size: 28px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.dtg-text strong {
+  display: block;
+  font-size: 15px;
+  margin-bottom: 4px;
+}
+
+.dtg-text p {
+  margin: 0 0 8px;
+  opacity: 0.95;
+  line-height: 1.4;
+}
+
+.dtg-list {
+  margin: 0;
+  padding-left: 18px;
+  opacity: 0.9;
+  font-size: 13px;
+}
+
+.dtg-dismiss {
+  margin-left: auto;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.15);
+  border: none;
+  color: #fff;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 16px;
+}
+
+.dtg-dismiss:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+img.dtg-highlight,
+a.dtg-highlight-link img {
+  outline: 3px solid #ef4444 !important;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 6px rgba(239, 68, 68, 0.35) !important;
+}
+
+a.dtg-highlight-link {
+  position: relative;
+}
+
+a.dtg-highlight-link::after {
+  content: "⚠ DOWNLOAD";
+  position: absolute;
+  bottom: 4px;
+  left: 4px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  pointer-events: none;
+}

@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Download Trap Guard",
+  "version": "2.0.0",
+  "description": "Warns when a Zoho Desk ticket has a clickable image that triggers a file download.",
+  "permissions": [],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["warning.css"],
+      "run_at": "document_end",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_title": "Download Trap Guard",
+    "default_popup": "popup.html"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "download-trap-guard",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Browser extension — warns when a page has clickable images that trigger downloads",
+  "scripts": {
+    "build": "tsc && node scripts/build.mjs",
+    "watch": "tsc --watch"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "typescript": "^5.7.2"
+  }
+}
