@@ -468,36 +468,40 @@ function applyHighlights(risks: RiskyTarget[]): void {
   activeHighlights = Array.from(uniq.entries()).map(([element, targetUrl]) => ({ element, targetUrl }));
   activeHighlights.forEach(({ element: el, targetUrl }) => {
     if (!targetUrl) return;
+    // Guard the entire per-element body: flagged elements can live inside
+    // same-origin iframes or framework-managed DOM that may reject mutations.
+    try {
+      if (el instanceof HTMLAnchorElement || el.tagName === "A") el.classList.add("dtg-highlight-link");
+      else el.classList.add("dtg-highlight-button");
+      el.querySelectorAll("img").forEach((img) => img.classList.add("dtg-highlight"));
+      flaggedElements.add(el);
 
-    if (el instanceof HTMLAnchorElement || el.tagName === "A") el.classList.add("dtg-highlight-link");
-    else el.classList.add("dtg-highlight-button");
-    el.querySelectorAll("img").forEach((img) => img.classList.add("dtg-highlight"));
-    flaggedElements.add(el);
+      // Set tooltip directly on the link so hovering anywhere on it shows the warning.
+      el.setAttribute("data-cbs-tooltip", "CBS Hunter: Phishing trap \u2014 do not click");
 
-    // Set tooltip directly on the link so hovering anywhere on it shows the warning.
-    el.setAttribute("data-cbs-tooltip", "CBS Hunter: Phishing trap \u2014 do not click");
-
-    // Inject a pulsing red badge immediately after the element (only once per element).
-    if (!el.nextElementSibling?.hasAttribute("data-cbs-badge")) {
-      try {
-        const badge = document.createElement("span");
+      // Inject a pulsing red badge immediately after the element (only once per element).
+      // Create the badge in the element's OWN document so insertion never crosses
+      // documents (the scanner descends into same-origin iframes).
+      if (el.parentNode && !el.nextElementSibling?.hasAttribute("data-cbs-badge")) {
+        const doc = el.ownerDocument ?? document;
+        const badge = doc.createElement("span");
         badge.className = "cbs-threat-badge";
         badge.setAttribute("data-cbs-badge", "1");
         badge.setAttribute("aria-label", "Phishing trap detected");
 
-        const icon = document.createElement("span");
+        const icon = doc.createElement("span");
         icon.className = "cbs-badge-icon";
         icon.textContent = "\u26A0";          // ⚠
 
-        const text = document.createElement("span");
+        const text = doc.createElement("span");
         text.className = "cbs-badge-text";
         text.textContent = "TRAP";
 
         badge.appendChild(icon);
         badge.appendChild(text);
         el.insertAdjacentElement("afterend", badge);
-      } catch { /* element may not support insertAdjacentElement */ }
-    }
+      }
+    } catch { /* element in a managed/cross-doc context — skip safely */ }
   });
 }
 
@@ -510,6 +514,9 @@ function clearWarnings(opts?: { removeHighlights?: boolean }): void {
       el.classList.remove("dtg-highlight-link", "dtg-highlight-button");
       el.removeAttribute("data-cbs-tooltip");
       el.querySelectorAll("img").forEach((img) => img.classList.remove("dtg-highlight"));
+      // Remove the badge sibling (covers badges inside same-origin iframes too).
+      const sib = el.nextElementSibling;
+      if (sib?.hasAttribute("data-cbs-badge")) sib.remove();
       flaggedElements.delete(el);
     } catch { /* ignore */ }
   }
