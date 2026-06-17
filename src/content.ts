@@ -497,6 +497,7 @@ async function rememberDismissed(key: string): Promise<void> {
 }
 
 function applyHighlights(risks: RiskyTarget[]): void {
+  if (!extensionAlive()) return;
   const uniq = new Map<HTMLElement, string>();
   for (const r of risks) uniq.set(r.element, r.targetUrl);
   activeHighlights = Array.from(uniq.entries()).map(([element, targetUrl]) => ({ element, targetUrl }));
@@ -673,49 +674,56 @@ function emailFingerprint(): string {
 }
 
 async function scanAndWarn(): Promise<void> {
-  // Stop entirely if the extension was reloaded/updated under us.
-  if (!extensionAlive()) { teardown(); return; }
-  if (!shouldActivate()) return;
+  // Wrap the ENTIRE body so the scan loop can never produce an uncaught promise
+  // rejection — e.g. "Extension context invalidated" after the extension reloads.
+  try {
+    // Stop entirely if the extension was reloaded/updated under us.
+    if (!extensionAlive()) { teardown(); return; }
+    if (!shouldActivate()) return;
 
-  // Detect when Zoho switches to a different conversation (same URL, different content).
-  const fp = emailFingerprint();
-  if (fp && fp !== lastEmailFingerprint) {
-    lastEmailFingerprint = fp;
-    ctxCache = null; ctxTs = 0;
-    clearWarnings();
-    lastBannerKey = "";
-  }
+    // Detect when Zoho switches to a different conversation (same URL, different content).
+    const fp = emailFingerprint();
+    if (fp && fp !== lastEmailFingerprint) {
+      lastEmailFingerprint = fp;
+      ctxCache = null; ctxTs = 0;
+      clearWarnings();
+      lastBannerKey = "";
+    }
 
-  const risks = findRiskyTargets();
-  if (risks.length === 0) return;
+    const risks = findRiskyTargets();
+    if (risks.length === 0) return;
 
-  // Always apply element highlights in the current frame.
-  applyHighlights(risks);
+    // Always apply element highlights in the current frame.
+    applyHighlights(risks);
 
-  const serialized = serializeRisks(risks);
+    const serialized = serializeRisks(risks);
 
-  if (window === window.top) {
-    // Main frame: show the CBS Hunter panel directly.
-    await showPanel(serialized);
-  } else {
-    // Sub-frame (email iframe): send risks up to the main frame.
-    try {
-      window.parent.postMessage(
-        { type: "CBS_HUNTER_IFRAME_RISKS", risks: serialized },
-        "*"
-      );
-    } catch { /* cross-origin parent blocked postMessage */ }
-  }
+    if (window === window.top) {
+      // Main frame: show the CBS Hunter panel directly.
+      await showPanel(serialized);
+    } else {
+      // Sub-frame (email iframe): send risks up to the main frame.
+      try {
+        window.parent.postMessage(
+          { type: "CBS_HUNTER_IFRAME_RISKS", risks: serialized },
+          "*"
+        );
+      } catch { /* cross-origin parent blocked postMessage */ }
+    }
 
-  if (extensionAlive()) {
-    try {
-      chrome.runtime.sendMessage({
-        type: "DOWNLOAD_TRAP_DETECTED",
-        count: risks.length,
-        url: window.location.href,
-        frame: window !== window.top
-      });
-    } catch { /* ignore */ }
+    if (extensionAlive()) {
+      try {
+        chrome.runtime.sendMessage({
+          type: "DOWNLOAD_TRAP_DETECTED",
+          count: risks.length,
+          url: window.location.href,
+          frame: window !== window.top
+        });
+      } catch { /* ignore */ }
+    }
+  } catch {
+    // Any failure (context loss, DOM rejection) — stop the orphaned script quietly.
+    teardown();
   }
 }
 
@@ -814,7 +822,7 @@ if (window === window.top) {
     if (!e.data || e.data.type !== "CBS_HUNTER_IFRAME_RISKS") return;
     const risks = e.data.risks as SerializedRisk[];
     if (!Array.isArray(risks) || risks.length === 0) return;
-    void showPanel(risks);
+    showPanel(risks).catch(() => { /* never let the panel reject uncaught */ });
   });
 }
 
