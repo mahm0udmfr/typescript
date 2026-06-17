@@ -230,15 +230,40 @@
 
 .dtg-highlight-link,
 .dtg-highlight-button {
-  outline: 3px solid #c8a030 !important;
-  outline-offset: 2px !important;
-  box-shadow: 0 0 10px rgba(200,160,48,0.5) !important;
+  outline: 3px solid #ef4444 !important;
+  outline-offset: 3px !important;
+  box-shadow: 0 0 14px rgba(239, 68, 68, 0.65) !important;
   border-radius: 3px !important;
   position: relative !important;
 }
 
 .dtg-highlight {
-  outline: 3px solid #c8a030 !important;
-  outline-offset: 2px !important;
-  box-shadow: 0 0 12px rgba(200,160,48,0.55) !important;
+  outline: 3px solid #ef4444 !important;
+  outline-offset: 3px !important;
+  box-shadow: 0 0 16px rgba(239, 68, 68, 0.7) !important;
+}
+
+/* ── Threat badge injected next to each flagged element ─────────────────── */
+
+.cbs-threat-badge {
+  all: unset !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 4px !important;
+  background: #ef4444 !important;
+  color: #fff !important;
+  font-size: 10px !important;
+  font-weight: 800 !important;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+  letter-spacing: 0.8px !important;
+  text-transform: uppercase !important;
+  padding: 2px 7px 2px 5px !important;
+  border-radius: 4px !important;
+  margin-left: 5px !important;
+  vertical-align: middle !important;
+  white-space: nowrap !important;
+  cursor: default !important;
+  pointer-events: none !important;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3) !important;
+  line-height: 1.6 !important;
 }

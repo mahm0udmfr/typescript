@@ -468,15 +468,29 @@ function applyHighlights(risks: RiskyTarget[]): void {
   activeHighlights = Array.from(uniq.entries()).map(([element, targetUrl]) => ({ element, targetUrl }));
   activeHighlights.forEach(({ element: el, targetUrl }) => {
     if (!targetUrl) return;
+
     if (el instanceof HTMLAnchorElement || el.tagName === "A") el.classList.add("dtg-highlight-link");
     else el.classList.add("dtg-highlight-button");
     el.querySelectorAll("img").forEach((img) => img.classList.add("dtg-highlight"));
     flaggedElements.add(el);
+
+    // Inject a red warning badge next to the flagged element (only once).
+    if (!el.nextSibling || !(el.nextSibling instanceof HTMLElement &&
+        el.nextSibling.classList.contains("cbs-threat-badge"))) {
+      const badge = document.createElement("span");
+      badge.className = "cbs-threat-badge";
+      badge.setAttribute("data-cbs-badge", "1");
+      badge.title = "CBS Hunter: Phishing trap — do not click";
+      badge.innerHTML = "&#9888; TRAP";
+      el.insertAdjacentElement("afterend", badge);
+    }
   });
 }
 
 function clearWarnings(opts?: { removeHighlights?: boolean }): void {
   document.getElementById(PANEL_ID)?.remove();
+  // Remove all injected threat badges in the current document.
+  document.querySelectorAll("[data-cbs-badge]").forEach((b) => b.remove());
   if (opts?.removeHighlights === false) return;
   for (const { element: el } of activeHighlights) {
     try {
