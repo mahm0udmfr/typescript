@@ -83,6 +83,16 @@ function markContextDead(e: unknown): void {
   if (String(e).toLowerCase().includes("context")) contextInvalidated = true;
 }
 
+// Intercept ANY unhandled promise rejection that contains "Extension context invalidated"
+// at the window level. Chrome logs these before JS try/catch can silence them — this handler
+// is the last line of defence that prevents them from appearing in DevTools.
+window.addEventListener("unhandledrejection", (ev) => {
+  if (String(ev.reason).toLowerCase().includes("context")) {
+    ev.preventDefault();
+    markContextDead(ev.reason);
+  }
+});
+
 type HighlightRef = { element: HTMLElement; targetUrl: string };
 
 if (!(globalThis as typeof globalThis & { DTGAnalysis?: unknown }).DTGAnalysis) {
@@ -550,7 +560,7 @@ async function _showPanel(risks: SerializedRisk[]): Promise<void> {
   let logoUrl = "";
   try {
     if (isContextAlive()) logoUrl = chrome.runtime.getURL("cbs-hunter-logo.png");
-  } catch { /* extension context invalidated */ }
+  } catch (e) { markContextDead(e); }
 
   function riskItem(r: SerializedRisk, idx: number): string {
     const realUrl = escapeHtml(r.targetUrl);
@@ -678,16 +688,17 @@ async function _scanAndWarn(): Promise<void> {
     } catch { /* cross-origin parent blocked postMessage */ }
   }
 
-  try {
-    if (isContextAlive()) {
+  // Badge-counter update — best-effort only, never throw if context is gone.
+  if (isContextAlive()) {
+    try {
       chrome.runtime.sendMessage({
         type: "DOWNLOAD_TRAP_DETECTED",
         count: risks.length,
         url: window.location.href,
         frame: window !== window.top
       });
-    }
-  } catch (e) { markContextDead(e); }
+    } catch (e) { markContextDead(e); }
+  }
 }
 
 function scheduleScan(): void {
@@ -768,9 +779,13 @@ function startWatching(): void {
   }
 }
 
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === "DTG_CLEAR_BANNER") { clearWarnings(); lastBannerKey = ""; }
-});
+try {
+  if (isContextAlive()) {
+    chrome.runtime.onMessage.addListener((message) => {
+      if (message.type === "DTG_CLEAR_BANNER") { clearWarnings(); lastBannerKey = ""; }
+    });
+  }
+} catch (e) { markContextDead(e); }
 
 // Main frame: receive serialized risks from cross-origin email iframes and show the panel.
 if (window === window.top) {
