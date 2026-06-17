@@ -69,13 +69,18 @@ let lastEmailFingerprint = "";
 let activeHighlights: HighlightRef[] = [];
 const flaggedElements = new WeakSet<HTMLElement>();
 
-/**
- * Returns false when the extension has been reloaded/updated and the current
- * content script context is no longer valid. All chrome.* API calls should be
- * gated behind this check to prevent "Extension context invalidated" errors.
- */
+// Set to true the first time we catch "Extension context invalidated".
+// Once dead, ALL chrome API calls and scan loops are permanently skipped.
+let contextInvalidated = false;
+
 function isContextAlive(): boolean {
-  try { return !!chrome?.runtime?.id; } catch { return false; }
+  if (contextInvalidated) return false;
+  try { return !!chrome?.runtime?.id; } catch { contextInvalidated = true; return false; }
+}
+
+/** Call when any chrome API throws "context invalidated" to silence all future work. */
+function markContextDead(e: unknown): void {
+  if (String(e).toLowerCase().includes("context")) contextInvalidated = true;
 }
 
 type HighlightRef = { element: HTMLElement; targetUrl: string };
@@ -460,7 +465,7 @@ async function isPanelDismissed(key: string): Promise<boolean> {
     if (!isContextAlive()) return false;
     const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
     return Boolean((d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined)?.[key]);
-  } catch { return false; }
+  } catch (e) { markContextDead(e); return false; }
 }
 
 async function rememberDismissed(key: string): Promise<void> {
@@ -470,7 +475,7 @@ async function rememberDismissed(key: string): Promise<void> {
     const map = (d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined) ?? {};
     map[key] = Date.now();
     await chrome.storage.session.set({ [DISMISS_STORAGE_KEY]: map });
-  } catch { /* ignore */ }
+  } catch (e) { markContextDead(e); }
 }
 
 function applyHighlights(risks: RiskyTarget[]): void {
@@ -530,6 +535,10 @@ function serializeRisks(risks: RiskyTarget[]): SerializedRisk[] {
  * Called only when window === window.top.
  */
 async function showPanel(risks: SerializedRisk[]): Promise<void> {
+  try { await _showPanel(risks); } catch (e) { markContextDead(e); }
+}
+
+async function _showPanel(risks: SerializedRisk[]): Promise<void> {
   const key = panelKey(risks);
   if (key === lastBannerKey) return;
   if (await isPanelDismissed(key)) return;
@@ -631,6 +640,10 @@ function emailFingerprint(): string {
 }
 
 async function scanAndWarn(): Promise<void> {
+  try { await _scanAndWarn(); } catch (e) { markContextDead(e); }
+}
+
+async function _scanAndWarn(): Promise<void> {
   if (!isContextAlive()) return;
   if (!shouldActivate()) return;
 
@@ -673,7 +686,7 @@ async function scanAndWarn(): Promise<void> {
         frame: window !== window.top
       });
     }
-  } catch { /* ignore */ }
+  } catch (e) { markContextDead(e); }
 }
 
 function scheduleScan(): void {
@@ -716,13 +729,15 @@ function startWatching(): void {
 
   // Delayed scans — email content in Zoho often loads 1-5s after document_idle
   for (const ms of [300, 800, 1500, 2500, 4000, 7000, 12000, 20000]) {
-    setTimeout(() => void scanAndWarn(), ms);
+    setTimeout(() => { if (!isContextAlive()) return; void scanAndWarn(); }, ms);
   }
 
   // Attach to iframes when they load
   const attachFrame = (frame: HTMLIFrameElement): void => {
-    frame.addEventListener("load", () => { setTimeout(() => void scanAndWarn(), 300); });
-    setTimeout(() => void scanAndWarn(), 800);
+    frame.addEventListener("load", () => {
+      setTimeout(() => { if (!isContextAlive()) return; void scanAndWarn(); }, 300);
+    });
+    setTimeout(() => { if (!isContextAlive()) return; void scanAndWarn(); }, 800);
   };
   document.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
   new MutationObserver((muts) => {
