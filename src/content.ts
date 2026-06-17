@@ -66,6 +66,38 @@ let startAttempts = 0;
 let lastWatchUrl = "";
 let lastEmailFingerprint = "";
 
+// Track timers/observers so we can tear everything down if the extension context
+// is invalidated (e.g. the extension was reloaded while this tab stayed open).
+let stopped = false;
+const intervals: ReturnType<typeof setInterval>[] = [];
+const observers: MutationObserver[] = [];
+
+/**
+ * Returns true while the extension's runtime context is still valid.
+ * After the extension is reloaded/updated, old content scripts linger in the page
+ * but every chrome.* call throws "Extension context invalidated". We detect that
+ * here and stop all work so no further errors are logged.
+ */
+function extensionAlive(): boolean {
+  if (stopped) return false;
+  try {
+    // Accessing chrome.runtime.id throws once the context is invalidated.
+    return Boolean(chrome.runtime?.id);
+  } catch {
+    return false;
+  }
+}
+
+/** Disconnect every timer/observer and remove UI. Called once on context loss. */
+function teardown(): void {
+  if (stopped) return;
+  stopped = true;
+  for (const id of intervals) { try { clearInterval(id); } catch { /* ignore */ } }
+  for (const ob of observers) { try { ob.disconnect(); } catch { /* ignore */ } }
+  if (scanTimer) { try { clearTimeout(scanTimer); } catch { /* ignore */ } }
+  try { clearWarnings(); } catch { /* ignore */ }
+}
+
 let activeHighlights: HighlightRef[] = [];
 const flaggedElements = new WeakSet<HTMLElement>();
 
@@ -447,6 +479,7 @@ function panelKey(risks: SerializedRisk[]): string {
 }
 
 async function isPanelDismissed(key: string): Promise<boolean> {
+  if (!extensionAlive()) return false;
   try {
     const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
     return Boolean((d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined)?.[key]);
@@ -454,6 +487,7 @@ async function isPanelDismissed(key: string): Promise<boolean> {
 }
 
 async function rememberDismissed(key: string): Promise<void> {
+  if (!extensionAlive()) return;
   try {
     const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
     const map = (d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined) ?? {};
@@ -543,9 +577,12 @@ async function showPanel(risks: SerializedRisk[]): Promise<void> {
 
   document.getElementById(PANEL_ID)?.remove();
 
-  const logoUrl = (typeof chrome !== "undefined" && chrome.runtime?.getURL)
-    ? chrome.runtime.getURL("cbs-hunter-logo.png")
-    : "";
+  let logoUrl = "";
+  try {
+    if (extensionAlive() && chrome.runtime?.getURL) {
+      logoUrl = chrome.runtime.getURL("cbs-hunter-logo.png");
+    }
+  } catch { /* context invalidated — render without logo */ }
 
   function riskItem(r: SerializedRisk, idx: number): string {
     const realUrl = escapeHtml(r.targetUrl);
@@ -636,6 +673,8 @@ function emailFingerprint(): string {
 }
 
 async function scanAndWarn(): Promise<void> {
+  // Stop entirely if the extension was reloaded/updated under us.
+  if (!extensionAlive()) { teardown(); return; }
   if (!shouldActivate()) return;
 
   // Detect when Zoho switches to a different conversation (same URL, different content).
@@ -668,17 +707,20 @@ async function scanAndWarn(): Promise<void> {
     } catch { /* cross-origin parent blocked postMessage */ }
   }
 
-  try {
-    chrome.runtime.sendMessage({
-      type: "DOWNLOAD_TRAP_DETECTED",
-      count: risks.length,
-      url: window.location.href,
-      frame: window !== window.top
-    });
-  } catch { /* ignore */ }
+  if (extensionAlive()) {
+    try {
+      chrome.runtime.sendMessage({
+        type: "DOWNLOAD_TRAP_DETECTED",
+        count: risks.length,
+        url: window.location.href,
+        frame: window !== window.top
+      });
+    } catch { /* ignore */ }
+  }
 }
 
 function scheduleScan(): void {
+  if (stopped) return;
   if (scanTimer) clearTimeout(scanTimer);
   scanTimer = setTimeout(() => void scanAndWarn(), 350);
 }
@@ -708,13 +750,17 @@ function startWatching(): void {
 
   void scanAndWarn();
 
-  new MutationObserver(scheduleScan).observe(document.documentElement, {
+  const domObserver = new MutationObserver(scheduleScan);
+  domObserver.observe(document.documentElement, {
     childList: true, subtree: true, attributes: true,
     attributeFilter: ["href", "src", "onclick", "formaction", "data-href", "data-url"]
   });
+  observers.push(domObserver);
 
-  setInterval(() => void scanAndWarn(), 5000);
-  setInterval(onRouteChange, 1500);
+  intervals.push(setInterval(() => void scanAndWarn(), 5000));
+  intervals.push(setInterval(onRouteChange, 1500));
+  // Watchdog: if the extension is reloaded, stop everything quietly.
+  intervals.push(setInterval(() => { if (!extensionAlive()) teardown(); }, 2000));
 
   // Delayed scans — email content in Zoho often loads 1-5s after document_idle
   for (const ms of [300, 800, 1500, 2500, 4000, 7000, 12000, 20000]) {
@@ -727,12 +773,14 @@ function startWatching(): void {
     setTimeout(() => void scanAndWarn(), 800);
   };
   document.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
-  new MutationObserver((muts) => {
+  const iframeObserver = new MutationObserver((muts) => {
     for (const m of muts) m.addedNodes.forEach((n) => {
       if (n instanceof HTMLIFrameElement) attachFrame(n);
       if (n instanceof Element) n.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
     });
-  }).observe(document.documentElement, { childList: true, subtree: true });
+  });
+  iframeObserver.observe(document.documentElement, { childList: true, subtree: true });
+  observers.push(iframeObserver);
 }
 
 // Expose rescan hook so the IIFE guard can call it on re-injection
@@ -754,9 +802,11 @@ function startWatching(): void {
   }
 }
 
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === "DTG_CLEAR_BANNER") { clearWarnings(); lastBannerKey = ""; }
-});
+try {
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type === "DTG_CLEAR_BANNER") { clearWarnings(); lastBannerKey = ""; }
+  });
+} catch { /* context invalidated at load time */ }
 
 // Main frame: receive serialized risks from cross-origin email iframes and show the panel.
 if (window === window.top) {
