@@ -32,7 +32,8 @@ const DTG = (): DtgAnalysisApi =>
   (globalThis as typeof globalThis & { DTGAnalysis: DtgAnalysisApi }).DTGAnalysis;
 
 const MIN_TRAP_IMAGE_PX = 16;
-const DISMISS_STORAGE_KEY = "dtg_dismissed_banners";
+// In-memory dismiss set — no Web API, no chrome API, cannot throw anything.
+const dismissedPanelKeys = new Set<string>();
 const MAX_BANNER_ITEMS = 10;
 const BUTTON_CLASS_RE = /\b(btn|button|cta|action|primary|submit)\b/i;
 
@@ -490,23 +491,12 @@ function panelKey(risks: SerializedRisk[]): string {
   return risks.map((r) => `${r.kind}|${r.targetUrl}|${r.displayLabel}`).sort().join("||");
 }
 
-// Use browser-native sessionStorage instead of chrome.storage.session so that
-// context-invalidation errors can never leak out of these functions.
 function isPanelDismissed(key: string): boolean {
-  try {
-    const raw = sessionStorage.getItem(DISMISS_STORAGE_KEY);
-    if (!raw) return false;
-    return Boolean((JSON.parse(raw) as Record<string, number>)[key]);
-  } catch { return false; }
+  return dismissedPanelKeys.has(key);
 }
 
 function rememberDismissed(key: string): void {
-  try {
-    const raw = sessionStorage.getItem(DISMISS_STORAGE_KEY) ?? "{}";
-    const map = JSON.parse(raw) as Record<string, number>;
-    map[key] = Date.now();
-    sessionStorage.setItem(DISMISS_STORAGE_KEY, JSON.stringify(map));
-  } catch { /* ignore */ }
+  dismissedPanelKeys.add(key);
 }
 
 function applyHighlights(risks: RiskyTarget[]): void {
