@@ -490,47 +490,54 @@ function rememberDismissed(key: string): void {
 }
 
 function applyHighlights(risks: RiskyTarget[]): void {
-  const uniq = new Map<HTMLElement, string>();
-  for (const r of risks) uniq.set(r.element, r.targetUrl);
-  activeHighlights = Array.from(uniq.entries()).map(([element, targetUrl]) => ({ element, targetUrl }));
-  activeHighlights.forEach(({ element: el, targetUrl }) => {
-    if (!targetUrl) return;
+  if (!isContextAlive()) return;
+  try {
+    const uniq = new Map<HTMLElement, string>();
+    for (const r of risks) uniq.set(r.element, r.targetUrl);
+    activeHighlights = Array.from(uniq.entries()).map(([element, targetUrl]) => ({ element, targetUrl }));
+    activeHighlights.forEach(({ element: el, targetUrl }) => {
+      if (!targetUrl) return;
+      try {
+        if (el instanceof HTMLAnchorElement || el.tagName === "A") el.classList.add("dtg-highlight-link");
+        else el.classList.add("dtg-highlight-button");
+        el.querySelectorAll("img").forEach((img) => img.classList.add("dtg-highlight"));
+        flaggedElements.add(el);
 
-    if (el instanceof HTMLAnchorElement || el.tagName === "A") el.classList.add("dtg-highlight-link");
-    else el.classList.add("dtg-highlight-button");
-    el.querySelectorAll("img").forEach((img) => img.classList.add("dtg-highlight"));
-    flaggedElements.add(el);
+        el.setAttribute("data-cbs-tooltip", "⚠  CBS Hunter: Phishing trap — do not click");
 
-    // Add tooltip attribute — CSS ::after rule reads this on hover.
-    el.setAttribute("data-cbs-tooltip", "⚠  CBS Hunter: Phishing trap — do not click");
-
-    // Inject a red pulsing TRAP badge immediately after the flagged element (only once).
-    const alreadyBadged = el.nextElementSibling?.classList.contains("cbs-threat-badge");
-    if (!alreadyBadged) {
-      const badge = document.createElement("span");
-      badge.className = "cbs-threat-badge";
-      badge.setAttribute("data-cbs-badge", "1");
-      // Shield icon + label — aligned via inline-flex in CSS
-      badge.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style="flex-shrink:0;vertical-align:middle"><path d="M12 2L3 7v5c0 5.25 3.75 10.15 9 11.35C17.25 22.15 21 17.25 21 12V7L12 2z"/></svg>TRAP`;
-      el.insertAdjacentElement("afterend", badge);
-    }
-  });
+        // Use a try/catch here specifically because nextElementSibling can throw
+        // "Extension context invalidated" on extension-injected nodes after context death.
+        const alreadyBadged = (() => {
+          try { return el.nextElementSibling?.classList.contains("cbs-threat-badge") ?? false; }
+          catch { return true; }
+        })();
+        if (!alreadyBadged) {
+          const badge = document.createElement("span");
+          badge.className = "cbs-threat-badge";
+          badge.setAttribute("data-cbs-badge", "1");
+          badge.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style="flex-shrink:0;vertical-align:middle"><path d="M12 2L3 7v5c0 5.25 3.75 10.15 9 11.35C17.25 22.15 21 17.25 21 12V7L12 2z"/></svg>TRAP`;
+          el.insertAdjacentElement("afterend", badge);
+        }
+      } catch (e) { markContextDead(e); }
+    });
+  } catch (e) { markContextDead(e); }
 }
 
 function clearWarnings(opts?: { removeHighlights?: boolean }): void {
-  document.getElementById(PANEL_ID)?.remove();
-  // Remove all injected threat badges in the current document.
-  document.querySelectorAll("[data-cbs-badge]").forEach((b) => b.remove());
-  if (opts?.removeHighlights === false) return;
-  for (const { element: el } of activeHighlights) {
-    try {
-      el.classList.remove("dtg-highlight-link", "dtg-highlight-button");
-      el.removeAttribute("data-cbs-tooltip");
-      el.querySelectorAll("img").forEach((img) => img.classList.remove("dtg-highlight"));
-      flaggedElements.delete(el);
-    } catch { /* ignore */ }
-  }
-  activeHighlights = [];
+  try {
+    document.getElementById(PANEL_ID)?.remove();
+    document.querySelectorAll("[data-cbs-badge]").forEach((b) => { try { b.remove(); } catch { /* ignore */ } });
+    if (opts?.removeHighlights === false) return;
+    for (const { element: el } of activeHighlights) {
+      try {
+        el.classList.remove("dtg-highlight-link", "dtg-highlight-button");
+        el.removeAttribute("data-cbs-tooltip");
+        el.querySelectorAll("img").forEach((img) => img.classList.remove("dtg-highlight"));
+        flaggedElements.delete(el);
+      } catch { /* ignore */ }
+    }
+    activeHighlights = [];
+  } catch (e) { markContextDead(e); }
 }
 
 /**
