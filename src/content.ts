@@ -69,6 +69,15 @@ let lastEmailFingerprint = "";
 let activeHighlights: HighlightRef[] = [];
 const flaggedElements = new WeakSet<HTMLElement>();
 
+/**
+ * Returns false when the extension has been reloaded/updated and the current
+ * content script context is no longer valid. All chrome.* API calls should be
+ * gated behind this check to prevent "Extension context invalidated" errors.
+ */
+function isContextAlive(): boolean {
+  try { return !!chrome?.runtime?.id; } catch { return false; }
+}
+
 type HighlightRef = { element: HTMLElement; targetUrl: string };
 
 if (!(globalThis as typeof globalThis & { DTGAnalysis?: unknown }).DTGAnalysis) {
@@ -448,6 +457,7 @@ function panelKey(risks: SerializedRisk[]): string {
 
 async function isPanelDismissed(key: string): Promise<boolean> {
   try {
+    if (!isContextAlive()) return false;
     const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
     return Boolean((d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined)?.[key]);
   } catch { return false; }
@@ -455,6 +465,7 @@ async function isPanelDismissed(key: string): Promise<boolean> {
 
 async function rememberDismissed(key: string): Promise<void> {
   try {
+    if (!isContextAlive()) return;
     const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
     const map = (d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined) ?? {};
     map[key] = Date.now();
@@ -526,9 +537,10 @@ async function showPanel(risks: SerializedRisk[]): Promise<void> {
 
   document.getElementById(PANEL_ID)?.remove();
 
-  const logoUrl = (typeof chrome !== "undefined" && chrome.runtime?.getURL)
-    ? chrome.runtime.getURL("cbs-hunter-logo.png")
-    : "";
+  let logoUrl = "";
+  try {
+    if (isContextAlive()) logoUrl = chrome.runtime.getURL("cbs-hunter-logo.png");
+  } catch { /* extension context invalidated */ }
 
   function riskItem(r: SerializedRisk, idx: number): string {
     const realUrl = escapeHtml(r.targetUrl);
@@ -619,6 +631,7 @@ function emailFingerprint(): string {
 }
 
 async function scanAndWarn(): Promise<void> {
+  if (!isContextAlive()) return;
   if (!shouldActivate()) return;
 
   // Detect when Zoho switches to a different conversation (same URL, different content).
@@ -652,12 +665,14 @@ async function scanAndWarn(): Promise<void> {
   }
 
   try {
-    chrome.runtime.sendMessage({
-      type: "DOWNLOAD_TRAP_DETECTED",
-      count: risks.length,
-      url: window.location.href,
-      frame: window !== window.top
-    });
+    if (isContextAlive()) {
+      chrome.runtime.sendMessage({
+        type: "DOWNLOAD_TRAP_DETECTED",
+        count: risks.length,
+        url: window.location.href,
+        frame: window !== window.top
+      });
+    }
   } catch { /* ignore */ }
 }
 
@@ -696,8 +711,8 @@ function startWatching(): void {
     attributeFilter: ["href", "src", "onclick", "formaction", "data-href", "data-url"]
   });
 
-  setInterval(() => void scanAndWarn(), 5000);
-  setInterval(onRouteChange, 1500);
+  setInterval(() => { if (!isContextAlive()) return; void scanAndWarn(); }, 5000);
+  setInterval(() => { if (!isContextAlive()) return; onRouteChange(); }, 1500);
 
   // Delayed scans — email content in Zoho often loads 1-5s after document_idle
   for (const ms of [300, 800, 1500, 2500, 4000, 7000, 12000, 20000]) {
