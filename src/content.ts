@@ -32,8 +32,7 @@ const DTG = (): DtgAnalysisApi =>
   (globalThis as typeof globalThis & { DTGAnalysis: DtgAnalysisApi }).DTGAnalysis;
 
 const MIN_TRAP_IMAGE_PX = 16;
-// In-memory dismiss set — no Web API, no chrome API, cannot throw anything.
-const dismissedPanelKeys = new Set<string>();
+const DISMISS_STORAGE_KEY = "dtg_dismissed_banners";
 const MAX_BANNER_ITEMS = 10;
 const BUTTON_CLASS_RE = /\b(btn|button|cta|action|primary|submit)\b/i;
 
@@ -69,50 +68,6 @@ let lastEmailFingerprint = "";
 
 let activeHighlights: HighlightRef[] = [];
 const flaggedElements = new WeakSet<HTMLElement>();
-
-// ── Context death management ────────────────────────────────────────────────
-// Once contextInvalidated is true, every callback, observer, and interval
-// must be stopped immediately so no further code runs on the dead context.
-let contextInvalidated = false;
-let _mutationObs: MutationObserver | null = null;
-let _iframeObs: MutationObserver | null = null;
-const _intervals: ReturnType<typeof setInterval>[] = [];
-
-function isContextAlive(): boolean {
-  if (contextInvalidated) return false;
-  try { return !!chrome?.runtime?.id; } catch { markContextDead("context"); return false; }
-}
-
-/**
- * Called whenever any chrome API or DOM operation throws "context invalidated".
- * Immediately stops ALL observers and intervals so nothing else can run.
- */
-function markContextDead(e: unknown): void {
-  if (contextInvalidated) return;
-  if (!String(e).toLowerCase().includes("context")) return;
-  contextInvalidated = true;
-  // Tear down everything — this is the only way to guarantee no more callbacks fire.
-  try { _mutationObs?.disconnect(); } catch { /* ignore */ }
-  try { _iframeObs?.disconnect(); } catch { /* ignore */ }
-  _intervals.forEach(id => { try { clearInterval(id); } catch { /* ignore */ } });
-  _intervals.length = 0;
-  if (scanTimer) { try { clearTimeout(scanTimer); } catch { /* ignore */ } scanTimer = null; }
-}
-
-// Intercept unhandled promise rejections AND synchronous errors caused by
-// "Extension context invalidated" before Chrome DevTools can log them.
-window.addEventListener("unhandledrejection", (ev) => {
-  if (String(ev.reason).toLowerCase().includes("context")) {
-    ev.preventDefault();
-    markContextDead(ev.reason);
-  }
-});
-window.addEventListener("error", (ev) => {
-  if (String(ev.message).toLowerCase().includes("context")) {
-    ev.preventDefault();
-    markContextDead(ev.message);
-  }
-}, true);
 
 type HighlightRef = { element: HTMLElement; targetUrl: string };
 
@@ -491,63 +446,74 @@ function panelKey(risks: SerializedRisk[]): string {
   return risks.map((r) => `${r.kind}|${r.targetUrl}|${r.displayLabel}`).sort().join("||");
 }
 
-function isPanelDismissed(key: string): boolean {
-  return dismissedPanelKeys.has(key);
+async function isPanelDismissed(key: string): Promise<boolean> {
+  try {
+    const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
+    return Boolean((d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined)?.[key]);
+  } catch { return false; }
 }
 
-function rememberDismissed(key: string): void {
-  dismissedPanelKeys.add(key);
+async function rememberDismissed(key: string): Promise<void> {
+  try {
+    const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
+    const map = (d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined) ?? {};
+    map[key] = Date.now();
+    await chrome.storage.session.set({ [DISMISS_STORAGE_KEY]: map });
+  } catch { /* ignore */ }
 }
 
 function applyHighlights(risks: RiskyTarget[]): void {
-  if (!isContextAlive()) return;
-  try {
-    const uniq = new Map<HTMLElement, string>();
-    for (const r of risks) uniq.set(r.element, r.targetUrl);
-    activeHighlights = Array.from(uniq.entries()).map(([element, targetUrl]) => ({ element, targetUrl }));
-    activeHighlights.forEach(({ element: el, targetUrl }) => {
-      if (!targetUrl) return;
+  const uniq = new Map<HTMLElement, string>();
+  for (const r of risks) uniq.set(r.element, r.targetUrl);
+  activeHighlights = Array.from(uniq.entries()).map(([element, targetUrl]) => ({ element, targetUrl }));
+  activeHighlights.forEach(({ element: el, targetUrl }) => {
+    if (!targetUrl) return;
+
+    if (el instanceof HTMLAnchorElement || el.tagName === "A") el.classList.add("dtg-highlight-link");
+    else el.classList.add("dtg-highlight-button");
+    el.querySelectorAll("img").forEach((img) => img.classList.add("dtg-highlight"));
+    flaggedElements.add(el);
+
+    // Set tooltip directly on the link so hovering anywhere on it shows the warning.
+    el.setAttribute("data-cbs-tooltip", "CBS Hunter: Phishing trap \u2014 do not click");
+
+    // Inject a pulsing red badge immediately after the element (only once per element).
+    if (!el.nextElementSibling?.hasAttribute("data-cbs-badge")) {
       try {
-        if (el instanceof HTMLAnchorElement || el.tagName === "A") el.classList.add("dtg-highlight-link");
-        else el.classList.add("dtg-highlight-button");
-        el.querySelectorAll("img").forEach((img) => img.classList.add("dtg-highlight"));
-        flaggedElements.add(el);
+        const badge = document.createElement("span");
+        badge.className = "cbs-threat-badge";
+        badge.setAttribute("data-cbs-badge", "1");
+        badge.setAttribute("aria-label", "Phishing trap detected");
 
-        el.setAttribute("data-cbs-tooltip", "⚠  CBS Hunter: Phishing trap — do not click");
+        const icon = document.createElement("span");
+        icon.className = "cbs-badge-icon";
+        icon.textContent = "\u26A0";          // ⚠
 
-        // Use a try/catch here specifically because nextElementSibling can throw
-        // "Extension context invalidated" on extension-injected nodes after context death.
-        const alreadyBadged = (() => {
-          try { return el.nextElementSibling?.classList.contains("cbs-threat-badge") ?? false; }
-          catch { return true; }
-        })();
-        if (!alreadyBadged) {
-          const badge = document.createElement("span");
-          badge.className = "cbs-threat-badge";
-          badge.setAttribute("data-cbs-badge", "1");
-          badge.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style="flex-shrink:0;vertical-align:middle"><path d="M12 2L3 7v5c0 5.25 3.75 10.15 9 11.35C17.25 22.15 21 17.25 21 12V7L12 2z"/></svg>TRAP`;
-          el.insertAdjacentElement("afterend", badge);
-        }
-      } catch (e) { markContextDead(e); }
-    });
-  } catch (e) { markContextDead(e); }
+        const text = document.createElement("span");
+        text.className = "cbs-badge-text";
+        text.textContent = "TRAP";
+
+        badge.appendChild(icon);
+        badge.appendChild(text);
+        el.insertAdjacentElement("afterend", badge);
+      } catch { /* element may not support insertAdjacentElement */ }
+    }
+  });
 }
 
 function clearWarnings(opts?: { removeHighlights?: boolean }): void {
-  try {
-    document.getElementById(PANEL_ID)?.remove();
-    document.querySelectorAll("[data-cbs-badge]").forEach((b) => { try { b.remove(); } catch { /* ignore */ } });
-    if (opts?.removeHighlights === false) return;
-    for (const { element: el } of activeHighlights) {
-      try {
-        el.classList.remove("dtg-highlight-link", "dtg-highlight-button");
-        el.removeAttribute("data-cbs-tooltip");
-        el.querySelectorAll("img").forEach((img) => img.classList.remove("dtg-highlight"));
-        flaggedElements.delete(el);
-      } catch { /* ignore */ }
-    }
-    activeHighlights = [];
-  } catch (e) { markContextDead(e); }
+  document.getElementById(PANEL_ID)?.remove();
+  document.querySelectorAll("[data-cbs-badge]").forEach((b) => b.remove());
+  if (opts?.removeHighlights === false) return;
+  for (const { element: el } of activeHighlights) {
+    try {
+      el.classList.remove("dtg-highlight-link", "dtg-highlight-button");
+      el.removeAttribute("data-cbs-tooltip");
+      el.querySelectorAll("img").forEach((img) => img.classList.remove("dtg-highlight"));
+      flaggedElements.delete(el);
+    } catch { /* ignore */ }
+  }
+  activeHighlights = [];
 }
 
 /**
@@ -563,21 +529,16 @@ function serializeRisks(risks: RiskyTarget[]): SerializedRisk[] {
  * Called only when window === window.top.
  */
 async function showPanel(risks: SerializedRisk[]): Promise<void> {
-  try { await _showPanel(risks); } catch (e) { markContextDead(e); }
-}
-
-async function _showPanel(risks: SerializedRisk[]): Promise<void> {
   const key = panelKey(risks);
   if (key === lastBannerKey) return;
-  if (isPanelDismissed(key)) return;
+  if (await isPanelDismissed(key)) return;
   lastBannerKey = key;
 
   document.getElementById(PANEL_ID)?.remove();
 
-  let logoUrl = "";
-  try {
-    if (isContextAlive()) logoUrl = chrome.runtime.getURL("cbs-hunter-logo.png");
-  } catch (e) { markContextDead(e); }
+  const logoUrl = (typeof chrome !== "undefined" && chrome.runtime?.getURL)
+    ? chrome.runtime.getURL("cbs-hunter-logo.png")
+    : "";
 
   function riskItem(r: SerializedRisk, idx: number): string {
     const realUrl = escapeHtml(r.targetUrl);
@@ -633,7 +594,7 @@ async function _showPanel(risks: SerializedRisk[]): Promise<void> {
     </div>`;
 
   panel.querySelector(".cbs-btn-dismiss")?.addEventListener("click", () => {
-    rememberDismissed(key);
+    void rememberDismissed(key);
     panel.classList.remove("cbs-visible");
     setTimeout(() => panel.remove(), 350);
   });
@@ -668,11 +629,6 @@ function emailFingerprint(): string {
 }
 
 async function scanAndWarn(): Promise<void> {
-  try { await _scanAndWarn(); } catch (e) { markContextDead(e); }
-}
-
-async function _scanAndWarn(): Promise<void> {
-  if (!isContextAlive()) return;
   if (!shouldActivate()) return;
 
   // Detect when Zoho switches to a different conversation (same URL, different content).
@@ -705,23 +661,19 @@ async function _scanAndWarn(): Promise<void> {
     } catch { /* cross-origin parent blocked postMessage */ }
   }
 
-  // Badge-counter update — best-effort only, never throw if context is gone.
-  if (isContextAlive()) {
-    try {
-      chrome.runtime.sendMessage({
-        type: "DOWNLOAD_TRAP_DETECTED",
-        count: risks.length,
-        url: window.location.href,
-        frame: window !== window.top
-      });
-    } catch (e) { markContextDead(e); }
-  }
+  try {
+    chrome.runtime.sendMessage({
+      type: "DOWNLOAD_TRAP_DETECTED",
+      count: risks.length,
+      url: window.location.href,
+      frame: window !== window.top
+    });
+  } catch { /* ignore */ }
 }
 
 function scheduleScan(): void {
-  if (!isContextAlive()) return;
   if (scanTimer) clearTimeout(scanTimer);
-  scanTimer = setTimeout(() => { if (!isContextAlive()) return; void scanAndWarn(); }, 350);
+  scanTimer = setTimeout(() => void scanAndWarn(), 350);
 }
 
 function onRouteChange(): void {
@@ -749,39 +701,31 @@ function startWatching(): void {
 
   void scanAndWarn();
 
-  // Store observer refs so markContextDead() can disconnect them instantly.
-  _mutationObs = new MutationObserver(scheduleScan);
-  _mutationObs.observe(document.documentElement, {
+  new MutationObserver(scheduleScan).observe(document.documentElement, {
     childList: true, subtree: true, attributes: true,
     attributeFilter: ["href", "src", "onclick", "formaction", "data-href", "data-url"]
   });
 
-  _intervals.push(
-    setInterval(() => { if (!isContextAlive()) return; void scanAndWarn(); }, 5000),
-    setInterval(() => { if (!isContextAlive()) return; onRouteChange(); }, 1500)
-  );
+  setInterval(() => void scanAndWarn(), 5000);
+  setInterval(onRouteChange, 1500);
 
   // Delayed scans — email content in Zoho often loads 1-5s after document_idle
   for (const ms of [300, 800, 1500, 2500, 4000, 7000, 12000, 20000]) {
-    setTimeout(() => { if (!isContextAlive()) return; void scanAndWarn(); }, ms);
+    setTimeout(() => void scanAndWarn(), ms);
   }
 
   // Attach to iframes when they load
   const attachFrame = (frame: HTMLIFrameElement): void => {
-    frame.addEventListener("load", () => {
-      setTimeout(() => { if (!isContextAlive()) return; void scanAndWarn(); }, 300);
-    });
-    setTimeout(() => { if (!isContextAlive()) return; void scanAndWarn(); }, 800);
+    frame.addEventListener("load", () => { setTimeout(() => void scanAndWarn(), 300); });
+    setTimeout(() => void scanAndWarn(), 800);
   };
   document.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
-  _iframeObs = new MutationObserver((muts) => {
-    if (!isContextAlive()) return;
+  new MutationObserver((muts) => {
     for (const m of muts) m.addedNodes.forEach((n) => {
       if (n instanceof HTMLIFrameElement) attachFrame(n);
       if (n instanceof Element) n.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
     });
-  });
-  _iframeObs.observe(document.documentElement, { childList: true, subtree: true });
+  }).observe(document.documentElement, { childList: true, subtree: true });
 }
 
 // Expose rescan hook so the IIFE guard can call it on re-injection
@@ -803,13 +747,9 @@ function startWatching(): void {
   }
 }
 
-try {
-  if (isContextAlive()) {
-    chrome.runtime.onMessage.addListener((message) => {
-      if (message.type === "DTG_CLEAR_BANNER") { clearWarnings(); lastBannerKey = ""; }
-    });
-  }
-} catch (e) { markContextDead(e); }
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === "DTG_CLEAR_BANNER") { clearWarnings(); lastBannerKey = ""; }
+});
 
 // Main frame: receive serialized risks from cross-origin email iframes and show the panel.
 if (window === window.top) {

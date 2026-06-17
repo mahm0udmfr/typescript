@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Download Trap Guard",
-  "version": "2.7.6",
+  "version": "2.7.0",
   "description": "Warns when a Zoho Desk ticket has a suspicious image, link, or button that triggers a file download.",
   "permissions": ["storage", "scripting"],
   "host_permissions": [
