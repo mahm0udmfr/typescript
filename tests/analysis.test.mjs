@@ -319,6 +319,30 @@ assert.equal(isSuspiciousCtaLabel("View feedback"), true, '"View feedback" shoul
 assert.equal(isSuspiciousCtaLabel("See details"), true, '"See details" should be a suspicious CTA label');
 assert.equal(isSuspiciousCtaLabel("Take action"), true, '"Take action" should be a suspicious CTA label');
 
+// ── Ticket #148736: Booking.com VCC phishing via search.app redirect ───────────
+// Sender: info@samartpeyzaj.com impersonating Booking.com.
+// Button "Review and respond" links to https://search.app/CHSyV (Google link-redirect
+// that hides the true destination). search.app is now a known trap host.
+
+const searchAppTrap = analyzeNavigationTarget(
+  "https://search.app/CHSyV",
+  "support.stayzltd.com",
+  "https://support.stayzltd.com/agent/tickets/details/148736",
+  {
+    kind: "button-link",
+    label: "Review and respond",
+    buttonStyled: true,
+    ticket: {
+      senderEmail: "info@samartpeyzaj.com",
+      subject: "Service Message: (5704682931)",
+      senderDisplayName: "Extranet"
+    }
+  }
+);
+assert.equal(searchAppTrap.dangerous, true, "search.app redirect should be flagged as a trap host");
+assert.ok(searchAppTrap.confidence >= 95, `searchAppTrap confidence: ${searchAppTrap.confidence}`);
+assert.equal(checkDownloadTrapHost("search.app").dangerous, true, "search.app should be a known trap host");
+
 // Real booking.com link from real booking.com address should NOT flag
 const realBookingLink = analyzeNavigationTarget(
   "https://booking.com/complaint?op_token=abc123",

@@ -55,6 +55,7 @@ export const TRUSTED_LINK_HOSTS = [
 
 export const DOWNLOAD_TRAP_HOST_EXACT = new Set([
   "share.google",
+  "search.app",         // Google link-redirect that hides the true destination
   "publick-gstx.com"    // confirmed phishing domain seen in multiple Booking.com lures
 ]);
 
