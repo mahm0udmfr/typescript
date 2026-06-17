@@ -13,6 +13,7 @@ spawnSync("node", [join(root, "scripts", "generate-icons.mjs")], { stdio: "inher
 copyFileSync(join(root, "manifest.json"), join(dist, "manifest.json"));
 copyFileSync(join(root, "src", "warning.css"), join(dist, "warning.css"));
 copyFileSync(join(root, "src", "popup.html"), join(dist, "popup.html"));
+copyFileSync(join(root, "src", "cbs-hunter-logo.png"), join(dist, "cbs-hunter-logo.png"));
 
 const iconsSrc = join(root, "icons");
 const iconsDist = join(dist, "icons");

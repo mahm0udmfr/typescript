@@ -32,7 +32,6 @@ const DTG = (): DtgAnalysisApi =>
   (globalThis as typeof globalThis & { DTGAnalysis: DtgAnalysisApi }).DTGAnalysis;
 
 const MIN_TRAP_IMAGE_PX = 16;
-const BANNER_ID = "dtg-warning-banner";
 const DISMISS_STORAGE_KEY = "dtg_dismissed_banners";
 const MAX_BANNER_ITEMS = 10;
 const BUTTON_CLASS_RE = /\b(btn|button|cta|action|primary|submit)\b/i;
@@ -46,6 +45,15 @@ interface RiskyTarget {
   element: HTMLElement;
   targetUrl: string;
   displayLabel: string;   // visible text/label of the element (may differ from targetUrl)
+  reason: string;
+  confidence: number;
+  kind: string;
+}
+
+// Serializable subset sent via postMessage from iframes to the main frame.
+interface SerializedRisk {
+  targetUrl: string;
+  displayLabel: string;
   reason: string;
   confidence: number;
   kind: string;
@@ -425,26 +433,20 @@ function findRiskyTargets(): RiskyTarget[] {
   return risks.sort((a, b) => b.confidence - a.confidence);
 }
 
-// ── Banner ─────────────────────────────────────────────────────────────────
+// ── CBS Hunter Panel ────────────────────────────────────────────────────────
+
+const PANEL_ID = "cbs-hunter-panel";
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
           .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-function shortUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    const q = u.search ? u.search.slice(0, 30) + (u.search.length > 30 ? "…" : "") : "";
-    return u.hostname + u.pathname + q;
-  } catch { return url.slice(0, 60); }
+function panelKey(risks: SerializedRisk[]): string {
+  return risks.map((r) => `${r.kind}|${r.targetUrl}|${r.displayLabel}`).sort().join("||");
 }
 
-function bannerKey(risks: RiskyTarget[]): string {
-  return risks.map((r) => `${r.kind}|${r.targetUrl}|${getLabel(r.element)}`).sort().join("||");
-}
-
-async function isBannerDismissed(key: string): Promise<boolean> {
+async function isPanelDismissed(key: string): Promise<boolean> {
   try {
     const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
     return Boolean((d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined)?.[key]);
@@ -474,7 +476,7 @@ function applyHighlights(risks: RiskyTarget[]): void {
 }
 
 function clearWarnings(opts?: { removeHighlights?: boolean }): void {
-  document.querySelectorAll(`#${BANNER_ID}`).forEach((el) => el.remove());
+  document.getElementById(PANEL_ID)?.remove();
   if (opts?.removeHighlights === false) return;
   for (const { element: el } of activeHighlights) {
     try {
@@ -486,87 +488,92 @@ function clearWarnings(opts?: { removeHighlights?: boolean }): void {
   activeHighlights = [];
 }
 
-async function showBanner(risks: RiskyTarget[]): Promise<void> {
-  applyHighlights(risks);
-
-  const key = bannerKey(risks);
-  if (key === lastBannerKey) return;
-  if (await isBannerDismissed(key)) return;
-  lastBannerKey = key;
-
-  document.querySelectorAll(`#${BANNER_ID}`).forEach((el) => el.remove());
-
-  const extra = risks.length > MAX_BANNER_ITEMS ? risks.length - MAX_BANNER_ITEMS : 0;
-  const banner = document.createElement("div");
-  banner.id = BANNER_ID;
-  banner.setAttribute("role", "alert");
-
-  function riskRow(r: RiskyTarget): string {
-    const realUrl = escapeHtml(r.targetUrl);
-    // Show the deceptive display text only when it differs meaningfully from the real URL
-    const labelText = r.displayLabel.trim();
-    const labelIsUrl = /^https?:\/\//i.test(labelText);
-    const labelDiffers = labelText && !r.targetUrl.toLowerCase().includes(labelText.toLowerCase().slice(0, 20));
-    const labelHtml = labelIsUrl && labelDiffers
-      ? `<span class="dtg-fake-url">Shown as: <code>${escapeHtml(labelText.slice(0, 120))}</code></span>`
-      : "";
-    return `<li>
-      <span class="dtg-reason">${escapeHtml(r.reason)}</span>
-      ${labelHtml}
-      <span class="dtg-dest">Real link: <code class="dtg-url-code">${realUrl}</code></span>
-    </li>`;
-  }
-
-  banner.innerHTML = `
-    <div class="dtg-inner">
-      <div class="dtg-icon" aria-hidden="true">!</div>
-      <div class="dtg-text">
-        <strong>Download trap — do not click</strong>
-        <p>This email has ${risks.length} suspicious item${risks.length === 1 ? "" : "s"} that may download malware. Do not click.</p>
-        <ul class="dtg-list">
-          ${risks.slice(0, MAX_BANNER_ITEMS).map(riskRow).join("")}
-          ${extra > 0 ? `<li>…and ${extra} more</li>` : ""}
-        </ul>
-      </div>
-      <button type="button" class="dtg-dismiss" aria-label="Dismiss">✕</button>
-    </div>`;
-
-  banner.querySelector(".dtg-dismiss")?.addEventListener("click", () => {
-    void rememberDismissed(key);
-    clearWarnings({ removeHighlights: false });
-  });
-
-  // Insert inside the email content area if we can find it, else prepend to body
-  const insertTarget = findEmailInsertPoint() ?? document.body;
-  insertTarget.insertBefore(banner, insertTarget.firstChild);
+/**
+ * Serialize RiskyTarget[] → SerializedRisk[] for cross-frame postMessage.
+ */
+function serializeRisks(risks: RiskyTarget[]): SerializedRisk[] {
+  return risks.map(({ targetUrl, displayLabel, reason, confidence, kind }) =>
+    ({ targetUrl, displayLabel, reason, confidence, kind }));
 }
 
-/** Find the best container to insert the banner into (inside the email, not the Zoho chrome). */
-function findEmailInsertPoint(): HTMLElement | null {
-  const MARKERS = [
-    '[class*="mailContent"]', '[class*="mailWrapper"]', '[class*="mailCont"]',
-    '[class*="thrdPlain"]', '[class*="richtext"]', '[class*="zd_v2-richtext"]',
-    '[class*="msgContent"]', '[class*="emailContent"]', '[class*="threadBody"]',
-    '[class*="threadContent"]', '[class*="contentArea"]', '[class*="rhsPanel"]',
-    '[class*="threadDetail"]', '[class*="conversation"]'
-  ];
-  for (const sel of MARKERS) {
-    const el = document.querySelector(sel);
-    if (el instanceof HTMLElement && !el.closest(LIST_EXCLUDE)) return el;
+/**
+ * Build and display the CBS Hunter side panel in the MAIN frame document.
+ * Called only when window === window.top.
+ */
+async function showPanel(risks: SerializedRisk[]): Promise<void> {
+  const key = panelKey(risks);
+  if (key === lastBannerKey) return;
+  if (await isPanelDismissed(key)) return;
+  lastBannerKey = key;
+
+  document.getElementById(PANEL_ID)?.remove();
+
+  const logoUrl = (typeof chrome !== "undefined" && chrome.runtime?.getURL)
+    ? chrome.runtime.getURL("cbs-hunter-logo.png")
+    : "";
+
+  function riskItem(r: SerializedRisk, idx: number): string {
+    const realUrl = escapeHtml(r.targetUrl);
+    const labelText = r.displayLabel.trim();
+    const labelIsUrl = /^https?:\/\//i.test(labelText);
+    const labelDiffers = labelText.length > 0 &&
+      !r.targetUrl.toLowerCase().includes(labelText.toLowerCase().slice(0, 20));
+
+    const fakeRow = labelIsUrl && labelDiffers
+      ? `<span class="cbs-item-row">
+           <span class="cbs-item-row-label">Shown as&nbsp;</span>
+           <span class="cbs-item-code cbs-fake">${escapeHtml(labelText.slice(0, 80))}</span>
+         </span>`
+      : "";
+
+    return `<div class="cbs-item">
+      <span class="cbs-item-reason">
+        <span class="cbs-item-num">${idx + 1}</span>${escapeHtml(r.reason)}
+      </span>
+      ${fakeRow}
+      <span class="cbs-item-row">
+        <span class="cbs-item-row-label">Real link&nbsp;</span>
+        <span class="cbs-item-code">${realUrl}</span>
+      </span>
+    </div>`;
   }
-  // try iframes
-  for (const frame of Array.from(document.querySelectorAll("iframe"))) {
-    try {
-      const doc = (frame as HTMLIFrameElement).contentDocument;
-      if (!doc?.body) continue;
-      for (const sel of MARKERS) {
-        const el = doc.querySelector(sel);
-        if (el instanceof HTMLElement) return el;
-      }
-      if (doc.body.children.length > 0) return doc.body;
-    } catch { /* cross-origin */ }
-  }
-  return null;
+
+  const extra = risks.length > MAX_BANNER_ITEMS ? risks.length - MAX_BANNER_ITEMS : 0;
+  const shown = risks.slice(0, MAX_BANNER_ITEMS);
+
+  const panel = document.createElement("div");
+  panel.id = PANEL_ID;
+  panel.setAttribute("role", "alert");
+  panel.innerHTML = `
+    <div class="cbs-header">
+      ${logoUrl ? `<img class="cbs-logo" src="${logoUrl}" alt="CBS Hunter">` : ""}
+      <div class="cbs-brand">
+        <span class="cbs-brand-top">Crown Business Solutions</span>
+        <span class="cbs-brand-hunter">Hunter</span>
+      </div>
+    </div>
+    <div class="cbs-alert-strip">
+      <span class="cbs-alert-icon">⚠</span>
+      <span class="cbs-alert-title">Phishing detected</span>
+      <span class="cbs-alert-count">${risks.length} item${risks.length === 1 ? "" : "s"}</span>
+    </div>
+    <div class="cbs-body">
+      ${shown.map(riskItem).join("")}
+      ${extra > 0 ? `<div class="cbs-item" style="text-align:center;color:#806a30;font-size:11px;">…and ${extra} more</div>` : ""}
+    </div>
+    <div class="cbs-footer">
+      <button type="button" class="cbs-btn cbs-btn-dismiss">✕&nbsp; Dismiss</button>
+    </div>`;
+
+  panel.querySelector(".cbs-btn-dismiss")?.addEventListener("click", () => {
+    void rememberDismissed(key);
+    panel.classList.remove("cbs-visible");
+    setTimeout(() => panel.remove(), 350);
+  });
+
+  document.body.appendChild(panel);
+  // Trigger slide-in animation on next frame
+  requestAnimationFrame(() => requestAnimationFrame(() => panel.classList.add("cbs-visible")));
 }
 
 // ── Main scan loop ─────────────────────────────────────────────────────────
@@ -608,7 +615,23 @@ async function scanAndWarn(): Promise<void> {
   const risks = findRiskyTargets();
   if (risks.length === 0) return;
 
-  await showBanner(risks);
+  // Always apply element highlights in the current frame.
+  applyHighlights(risks);
+
+  const serialized = serializeRisks(risks);
+
+  if (window === window.top) {
+    // Main frame: show the CBS Hunter panel directly.
+    await showPanel(serialized);
+  } else {
+    // Sub-frame (email iframe): send risks up to the main frame.
+    try {
+      window.parent.postMessage(
+        { type: "CBS_HUNTER_IFRAME_RISKS", risks: serialized },
+        "*"
+      );
+    } catch { /* cross-origin parent blocked postMessage */ }
+  }
 
   try {
     chrome.runtime.sendMessage({
@@ -699,6 +722,16 @@ function startWatching(): void {
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "DTG_CLEAR_BANNER") { clearWarnings(); lastBannerKey = ""; }
 });
+
+// Main frame: receive serialized risks from cross-origin email iframes and show the panel.
+if (window === window.top) {
+  window.addEventListener("message", (e) => {
+    if (!e.data || e.data.type !== "CBS_HUNTER_IFRAME_RISKS") return;
+    const risks = e.data.risks as SerializedRisk[];
+    if (!Array.isArray(risks) || risks.length === 0) return;
+    void showPanel(risks);
+  });
+}
 
 // ── Click / keyboard blocking ──────────────────────────────────────────────
 
