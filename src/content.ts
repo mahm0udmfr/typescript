@@ -32,7 +32,6 @@ const DTG = (): DtgAnalysisApi =>
   (globalThis as typeof globalThis & { DTGAnalysis: DtgAnalysisApi }).DTGAnalysis;
 
 const MIN_TRAP_IMAGE_PX = 16;
-const BANNER_ID = "dtg-warning-banner";
 const DISMISS_STORAGE_KEY = "dtg_dismissed_banners";
 const MAX_BANNER_ITEMS = 10;
 const BUTTON_CLASS_RE = /\b(btn|button|cta|action|primary|submit)\b/i;
@@ -51,12 +50,53 @@ interface RiskyTarget {
   kind: string;
 }
 
+// Serializable subset sent via postMessage from iframes to the main frame.
+interface SerializedRisk {
+  targetUrl: string;
+  displayLabel: string;
+  reason: string;
+  confidence: number;
+  kind: string;
+}
+
 let lastBannerKey = "";
 let scanTimer: ReturnType<typeof setTimeout> | null = null;
 let watching = false;
 let startAttempts = 0;
 let lastWatchUrl = "";
 let lastEmailFingerprint = "";
+
+// Track timers/observers so we can tear everything down if the extension context
+// is invalidated (e.g. the extension was reloaded while this tab stayed open).
+let stopped = false;
+const intervals: ReturnType<typeof setInterval>[] = [];
+const observers: MutationObserver[] = [];
+
+/**
+ * Returns true while the extension's runtime context is still valid.
+ * After the extension is reloaded/updated, old content scripts linger in the page
+ * but every chrome.* call throws "Extension context invalidated". We detect that
+ * here and stop all work so no further errors are logged.
+ */
+function extensionAlive(): boolean {
+  if (stopped) return false;
+  try {
+    // Accessing chrome.runtime.id throws once the context is invalidated.
+    return Boolean(chrome.runtime?.id);
+  } catch {
+    return false;
+  }
+}
+
+/** Disconnect every timer/observer and remove UI. Called once on context loss. */
+function teardown(): void {
+  if (stopped) return;
+  stopped = true;
+  for (const id of intervals) { try { clearInterval(id); } catch { /* ignore */ } }
+  for (const ob of observers) { try { ob.disconnect(); } catch { /* ignore */ } }
+  if (scanTimer) { try { clearTimeout(scanTimer); } catch { /* ignore */ } }
+  try { clearWarnings(); } catch { /* ignore */ }
+}
 
 let activeHighlights: HighlightRef[] = [];
 const flaggedElements = new WeakSet<HTMLElement>();
@@ -425,26 +465,21 @@ function findRiskyTargets(): RiskyTarget[] {
   return risks.sort((a, b) => b.confidence - a.confidence);
 }
 
-// ── Banner ─────────────────────────────────────────────────────────────────
+// ── CBS Hunter Panel ────────────────────────────────────────────────────────
+
+const PANEL_ID = "cbs-hunter-panel";
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
           .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-function shortUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    const q = u.search ? u.search.slice(0, 30) + (u.search.length > 30 ? "…" : "") : "";
-    return u.hostname + u.pathname + q;
-  } catch { return url.slice(0, 60); }
+function panelKey(risks: SerializedRisk[]): string {
+  return risks.map((r) => `${r.kind}|${r.targetUrl}|${r.displayLabel}`).sort().join("||");
 }
 
-function bannerKey(risks: RiskyTarget[]): string {
-  return risks.map((r) => `${r.kind}|${r.targetUrl}|${getLabel(r.element)}`).sort().join("||");
-}
-
-async function isBannerDismissed(key: string): Promise<boolean> {
+async function isPanelDismissed(key: string): Promise<boolean> {
+  if (!extensionAlive()) return false;
   try {
     const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
     return Boolean((d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined)?.[key]);
@@ -452,6 +487,7 @@ async function isBannerDismissed(key: string): Promise<boolean> {
 }
 
 async function rememberDismissed(key: string): Promise<void> {
+  if (!extensionAlive()) return;
   try {
     const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
     const map = (d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined) ?? {};
@@ -461,112 +497,171 @@ async function rememberDismissed(key: string): Promise<void> {
 }
 
 function applyHighlights(risks: RiskyTarget[]): void {
+  if (!extensionAlive()) return;
   const uniq = new Map<HTMLElement, string>();
   for (const r of risks) uniq.set(r.element, r.targetUrl);
   activeHighlights = Array.from(uniq.entries()).map(([element, targetUrl]) => ({ element, targetUrl }));
   activeHighlights.forEach(({ element: el, targetUrl }) => {
     if (!targetUrl) return;
-    if (el instanceof HTMLAnchorElement || el.tagName === "A") el.classList.add("dtg-highlight-link");
-    else el.classList.add("dtg-highlight-button");
-    el.querySelectorAll("img").forEach((img) => img.classList.add("dtg-highlight"));
-    flaggedElements.add(el);
+    // Guard the entire per-element body: flagged elements can live inside
+    // same-origin iframes or framework-managed DOM that may reject mutations.
+    try {
+      if (el instanceof HTMLAnchorElement || el.tagName === "A") el.classList.add("dtg-highlight-link");
+      else el.classList.add("dtg-highlight-button");
+      el.querySelectorAll("img").forEach((img) => img.classList.add("dtg-highlight"));
+      flaggedElements.add(el);
+
+      // Set tooltip directly on the link so hovering anywhere on it shows the warning.
+      el.setAttribute("data-cbs-tooltip", "CBS Hunter: Phishing trap \u2014 do not click");
+
+      // Inject a pulsing red badge immediately after the element (only once per element).
+      // Create the badge in the element's OWN document so insertion never crosses
+      // documents (the scanner descends into same-origin iframes).
+      if (el.parentNode && !el.nextElementSibling?.hasAttribute("data-cbs-badge")) {
+        const doc = el.ownerDocument ?? document;
+        const badge = doc.createElement("span");
+        badge.className = "cbs-threat-badge";
+        badge.setAttribute("data-cbs-badge", "1");
+        badge.setAttribute("aria-label", "Phishing trap detected");
+
+        const icon = doc.createElement("span");
+        icon.className = "cbs-badge-icon";
+        icon.textContent = "\u26A0";          // ⚠
+
+        const text = doc.createElement("span");
+        text.className = "cbs-badge-text";
+        text.textContent = "TRAP";
+
+        badge.appendChild(icon);
+        badge.appendChild(text);
+        el.insertAdjacentElement("afterend", badge);
+      }
+    } catch { /* element in a managed/cross-doc context — skip safely */ }
   });
 }
 
 function clearWarnings(opts?: { removeHighlights?: boolean }): void {
-  document.querySelectorAll(`#${BANNER_ID}`).forEach((el) => el.remove());
+  document.getElementById(PANEL_ID)?.remove();
+  document.querySelectorAll("[data-cbs-badge]").forEach((b) => b.remove());
   if (opts?.removeHighlights === false) return;
+  clearHighlights();
+}
+
+function clearHighlights(): void {
   for (const { element: el } of activeHighlights) {
     try {
       el.classList.remove("dtg-highlight-link", "dtg-highlight-button");
+      el.removeAttribute("data-cbs-tooltip");
       el.querySelectorAll("img").forEach((img) => img.classList.remove("dtg-highlight"));
+      // Remove the badge sibling (covers badges inside same-origin iframes too).
+      const sib = el.nextElementSibling;
+      if (sib?.hasAttribute("data-cbs-badge")) sib.remove();
       flaggedElements.delete(el);
     } catch { /* ignore */ }
   }
   activeHighlights = [];
 }
 
-async function showBanner(risks: RiskyTarget[]): Promise<void> {
-  applyHighlights(risks);
-
-  const key = bannerKey(risks);
-  if (key === lastBannerKey) return;
-  if (await isBannerDismissed(key)) return;
-  lastBannerKey = key;
-
-  document.querySelectorAll(`#${BANNER_ID}`).forEach((el) => el.remove());
-
-  const extra = risks.length > MAX_BANNER_ITEMS ? risks.length - MAX_BANNER_ITEMS : 0;
-  const banner = document.createElement("div");
-  banner.id = BANNER_ID;
-  banner.setAttribute("role", "alert");
-
-  function riskRow(r: RiskyTarget): string {
-    const realUrl = escapeHtml(r.targetUrl);
-    // Show the deceptive display text only when it differs meaningfully from the real URL
-    const labelText = r.displayLabel.trim();
-    const labelIsUrl = /^https?:\/\//i.test(labelText);
-    const labelDiffers = labelText && !r.targetUrl.toLowerCase().includes(labelText.toLowerCase().slice(0, 20));
-    const labelHtml = labelIsUrl && labelDiffers
-      ? `<span class="dtg-fake-url">Shown as: <code>${escapeHtml(labelText.slice(0, 120))}</code></span>`
-      : "";
-    return `<li>
-      <span class="dtg-reason">${escapeHtml(r.reason)}</span>
-      ${labelHtml}
-      <span class="dtg-dest">Real link: <code class="dtg-url-code">${realUrl}</code></span>
-    </li>`;
-  }
-
-  banner.innerHTML = `
-    <div class="dtg-inner">
-      <div class="dtg-icon" aria-hidden="true">!</div>
-      <div class="dtg-text">
-        <strong>Download trap — do not click</strong>
-        <p>This email has ${risks.length} suspicious item${risks.length === 1 ? "" : "s"} that may download malware. Do not click.</p>
-        <ul class="dtg-list">
-          ${risks.slice(0, MAX_BANNER_ITEMS).map(riskRow).join("")}
-          ${extra > 0 ? `<li>…and ${extra} more</li>` : ""}
-        </ul>
-      </div>
-      <button type="button" class="dtg-dismiss" aria-label="Dismiss">✕</button>
-    </div>`;
-
-  banner.querySelector(".dtg-dismiss")?.addEventListener("click", () => {
-    void rememberDismissed(key);
-    clearWarnings({ removeHighlights: false });
-  });
-
-  // Insert inside the email content area if we can find it, else prepend to body
-  const insertTarget = findEmailInsertPoint() ?? document.body;
-  insertTarget.insertBefore(banner, insertTarget.firstChild);
+/**
+ * Serialize RiskyTarget[] → SerializedRisk[] for cross-frame postMessage.
+ */
+function serializeRisks(risks: RiskyTarget[]): SerializedRisk[] {
+  return risks.map(({ targetUrl, displayLabel, reason, confidence, kind }) =>
+    ({ targetUrl, displayLabel, reason, confidence, kind }));
 }
 
-/** Find the best container to insert the banner into (inside the email, not the Zoho chrome). */
-function findEmailInsertPoint(): HTMLElement | null {
-  const MARKERS = [
-    '[class*="mailContent"]', '[class*="mailWrapper"]', '[class*="mailCont"]',
-    '[class*="thrdPlain"]', '[class*="richtext"]', '[class*="zd_v2-richtext"]',
-    '[class*="msgContent"]', '[class*="emailContent"]', '[class*="threadBody"]',
-    '[class*="threadContent"]', '[class*="contentArea"]', '[class*="rhsPanel"]',
-    '[class*="threadDetail"]', '[class*="conversation"]'
-  ];
-  for (const sel of MARKERS) {
-    const el = document.querySelector(sel);
-    if (el instanceof HTMLElement && !el.closest(LIST_EXCLUDE)) return el;
+/**
+ * Build and display the CBS Hunter side panel in the MAIN frame document.
+ * Called only when window === window.top.
+ */
+async function showPanel(risks: SerializedRisk[]): Promise<void> {
+  const key = panelKey(risks);
+  if (key === lastBannerKey) return;
+  if (await isPanelDismissed(key)) return;
+  lastBannerKey = key;
+  const existingPanel = document.getElementById(PANEL_ID);
+
+  let logoUrl = "";
+  try {
+    if (extensionAlive() && chrome.runtime?.getURL) {
+      logoUrl = chrome.runtime.getURL("cbs-hunter-logo.png");
+    }
+  } catch { /* context invalidated — render without logo */ }
+
+  function riskItem(r: SerializedRisk, idx: number): string {
+    const realUrl = escapeHtml(r.targetUrl);
+    const labelText = r.displayLabel.trim();
+    const labelIsUrl = /^https?:\/\//i.test(labelText);
+    const labelDiffers = labelText.length > 0 &&
+      !r.targetUrl.toLowerCase().includes(labelText.toLowerCase().slice(0, 20));
+
+    const fakeRow = labelIsUrl && labelDiffers
+      ? `<span class="cbs-item-row">
+           <span class="cbs-item-row-label">Shown as&nbsp;</span>
+           <span class="cbs-item-code cbs-fake">${escapeHtml(labelText.slice(0, 80))}</span>
+         </span>`
+      : "";
+
+    return `<div class="cbs-item">
+      <span class="cbs-item-reason">
+        <span class="cbs-item-num">${idx + 1}</span>${escapeHtml(r.reason)}
+      </span>
+      ${fakeRow}
+      <span class="cbs-item-row">
+        <span class="cbs-item-row-label">Real link&nbsp;</span>
+        <span class="cbs-item-code">${realUrl}</span>
+      </span>
+    </div>`;
   }
-  // try iframes
-  for (const frame of Array.from(document.querySelectorAll("iframe"))) {
-    try {
-      const doc = (frame as HTMLIFrameElement).contentDocument;
-      if (!doc?.body) continue;
-      for (const sel of MARKERS) {
-        const el = doc.querySelector(sel);
-        if (el instanceof HTMLElement) return el;
-      }
-      if (doc.body.children.length > 0) return doc.body;
-    } catch { /* cross-origin */ }
+
+  const extra = risks.length > MAX_BANNER_ITEMS ? risks.length - MAX_BANNER_ITEMS : 0;
+  const shown = risks.slice(0, MAX_BANNER_ITEMS);
+
+  const panel = document.createElement("div");
+  panel.id = PANEL_ID;
+  panel.setAttribute("role", "alert");
+  panel.innerHTML = `
+    <div class="cbs-header">
+      ${logoUrl ? `<img class="cbs-logo" src="${logoUrl}" alt="CBS Hunter">` : ""}
+      <div class="cbs-brand">
+        <span class="cbs-brand-top">Crown Business Solutions</span>
+        <span class="cbs-brand-hunter">Hunter</span>
+      </div>
+    </div>
+    <div class="cbs-alert-strip">
+      <span class="cbs-alert-icon">⚠</span>
+      <span class="cbs-alert-title">Phishing detected</span>
+      <span class="cbs-alert-count">${risks.length} item${risks.length === 1 ? "" : "s"}</span>
+    </div>
+    <div class="cbs-body">
+      ${shown.map(riskItem).join("")}
+      ${extra > 0 ? `<div class="cbs-item" style="text-align:center;color:#806a30;font-size:11px;">…and ${extra} more</div>` : ""}
+    </div>
+    <div class="cbs-footer">
+      <button type="button" class="cbs-btn cbs-btn-dismiss">✕&nbsp; Dismiss</button>
+    </div>`;
+
+  const bindDismiss = (target: HTMLElement): void => {
+    target.querySelector(".cbs-btn-dismiss")?.addEventListener("click", () => {
+      void rememberDismissed(key);
+      target.classList.remove("cbs-visible");
+      setTimeout(() => target.remove(), 350);
+    });
+  };
+
+  if (existingPanel) {
+    // Risk results can arrive twice: once from the main-frame scan and once from
+    // the email iframe postMessage. Keep the SAME root element visible and only
+    // update its content; replacing the root can look like a second animation.
+    existingPanel.innerHTML = panel.innerHTML;
+    existingPanel.classList.add("cbs-visible");
+    bindDismiss(existingPanel);
+  } else {
+    document.body.appendChild(panel);
+    bindDismiss(panel);
+    // Trigger slide-in animation only for the first render.
+    requestAnimationFrame(() => requestAnimationFrame(() => panel.classList.add("cbs-visible")));
   }
-  return null;
 }
 
 // ── Main scan loop ─────────────────────────────────────────────────────────
@@ -583,10 +678,18 @@ function emailFingerprint(): string {
     '[class*="msgContent"]', '[class*="emailContent"]', '[class*="threadBody"]',
     '[class*="richtext"]', '[class*="threadDetail"]', '[class*="conversation"]'
   ];
+  const visibleTextWithoutHunterUi = (el: Element): string => {
+    const clone = el.cloneNode(true);
+    if (!(clone instanceof Element)) return "";
+    // Ignore our injected badges/panel; otherwise the second scan sees "TRAP"
+    // as new email text, clears the panel, and replays the warning animation.
+    clone.querySelectorAll("[data-cbs-badge], #cbs-hunter-panel").forEach((n) => n.remove());
+    return clone.textContent?.replace(/\s+/g, " ").trim().slice(0, 200) ?? "";
+  };
   for (const sel of EMAIL_SELECTORS) {
     const el = document.querySelector(sel);
     if (el && !el.closest(LIST_EXCLUDE)) {
-      const t = el.textContent?.replace(/\s+/g, " ").trim().slice(0, 200) ?? "";
+      const t = visibleTextWithoutHunterUi(el);
       if (t.length > 20) return t;
     }
   }
@@ -594,33 +697,72 @@ function emailFingerprint(): string {
 }
 
 async function scanAndWarn(): Promise<void> {
-  if (!shouldActivate()) return;
-
-  // Detect when Zoho switches to a different conversation (same URL, different content).
-  const fp = emailFingerprint();
-  if (fp && fp !== lastEmailFingerprint) {
-    lastEmailFingerprint = fp;
-    ctxCache = null; ctxTs = 0;
-    clearWarnings();
-    lastBannerKey = "";
-  }
-
-  const risks = findRiskyTargets();
-  if (risks.length === 0) return;
-
-  await showBanner(risks);
-
+  // Wrap the ENTIRE body so the scan loop can never produce an uncaught promise
+  // rejection — e.g. "Extension context invalidated" after the extension reloads.
   try {
-    chrome.runtime.sendMessage({
-      type: "DOWNLOAD_TRAP_DETECTED",
-      count: risks.length,
-      url: window.location.href,
-      frame: window !== window.top
-    });
-  } catch { /* ignore */ }
+    // Stop entirely if the extension was reloaded/updated under us.
+    if (!extensionAlive()) { teardown(); return; }
+    if (!shouldActivate()) return;
+
+    // Detect when Zoho switches to a different conversation (same URL, different content).
+    // Do NOT clear the panel yet: Zoho can mutate the same email during load.
+    // We scan first, then clear only if the new content has no risks.
+    const fp = emailFingerprint();
+    const contentChanged = Boolean(fp && fp !== lastEmailFingerprint);
+    if (fp && fp !== lastEmailFingerprint) {
+      lastEmailFingerprint = fp;
+      ctxCache = null; ctxTs = 0;
+    }
+
+    const risks = findRiskyTargets();
+    if (risks.length === 0) {
+      if (contentChanged) {
+        clearWarnings();
+        lastBannerKey = "";
+      }
+      return;
+    }
+
+    // If the content changed but phishing is still present, refresh highlights
+    // without removing the already-visible panel (prevents double animation).
+    if (contentChanged) clearHighlights();
+
+    // Always apply element highlights in the current frame.
+    applyHighlights(risks);
+
+    const serialized = serializeRisks(risks);
+
+    if (window === window.top) {
+      // Main frame: show the CBS Hunter panel directly.
+      await showPanel(serialized);
+    } else {
+      // Sub-frame (email iframe): send risks up to the main frame.
+      try {
+        window.parent.postMessage(
+          { type: "CBS_HUNTER_IFRAME_RISKS", risks: serialized },
+          "*"
+        );
+      } catch { /* cross-origin parent blocked postMessage */ }
+    }
+
+    if (extensionAlive()) {
+      try {
+        chrome.runtime.sendMessage({
+          type: "DOWNLOAD_TRAP_DETECTED",
+          count: risks.length,
+          url: window.location.href,
+          frame: window !== window.top
+        });
+      } catch { /* ignore */ }
+    }
+  } catch {
+    // Any failure (context loss, DOM rejection) — stop the orphaned script quietly.
+    teardown();
+  }
 }
 
 function scheduleScan(): void {
+  if (stopped) return;
   if (scanTimer) clearTimeout(scanTimer);
   scanTimer = setTimeout(() => void scanAndWarn(), 350);
 }
@@ -650,13 +792,17 @@ function startWatching(): void {
 
   void scanAndWarn();
 
-  new MutationObserver(scheduleScan).observe(document.documentElement, {
+  const domObserver = new MutationObserver(scheduleScan);
+  domObserver.observe(document.documentElement, {
     childList: true, subtree: true, attributes: true,
     attributeFilter: ["href", "src", "onclick", "formaction", "data-href", "data-url"]
   });
+  observers.push(domObserver);
 
-  setInterval(() => void scanAndWarn(), 5000);
-  setInterval(onRouteChange, 1500);
+  intervals.push(setInterval(() => void scanAndWarn(), 5000));
+  intervals.push(setInterval(onRouteChange, 1500));
+  // Watchdog: if the extension is reloaded, stop everything quietly.
+  intervals.push(setInterval(() => { if (!extensionAlive()) teardown(); }, 2000));
 
   // Delayed scans — email content in Zoho often loads 1-5s after document_idle
   for (const ms of [300, 800, 1500, 2500, 4000, 7000, 12000, 20000]) {
@@ -669,12 +815,14 @@ function startWatching(): void {
     setTimeout(() => void scanAndWarn(), 800);
   };
   document.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
-  new MutationObserver((muts) => {
+  const iframeObserver = new MutationObserver((muts) => {
     for (const m of muts) m.addedNodes.forEach((n) => {
       if (n instanceof HTMLIFrameElement) attachFrame(n);
       if (n instanceof Element) n.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
     });
-  }).observe(document.documentElement, { childList: true, subtree: true });
+  });
+  iframeObserver.observe(document.documentElement, { childList: true, subtree: true });
+  observers.push(iframeObserver);
 }
 
 // Expose rescan hook so the IIFE guard can call it on re-injection
@@ -696,9 +844,21 @@ function startWatching(): void {
   }
 }
 
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === "DTG_CLEAR_BANNER") { clearWarnings(); lastBannerKey = ""; }
-});
+try {
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type === "DTG_CLEAR_BANNER") { clearWarnings(); lastBannerKey = ""; }
+  });
+} catch { /* context invalidated at load time */ }
+
+// Main frame: receive serialized risks from cross-origin email iframes and show the panel.
+if (window === window.top) {
+  window.addEventListener("message", (e) => {
+    if (!e.data || e.data.type !== "CBS_HUNTER_IFRAME_RISKS") return;
+    const risks = e.data.risks as SerializedRisk[];
+    if (!Array.isArray(risks) || risks.length === 0) return;
+    showPanel(risks).catch(() => { /* never let the panel reject uncaught */ });
+  });
+}
 
 // ── Click / keyboard blocking ──────────────────────────────────────────────
 
