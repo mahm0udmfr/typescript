@@ -1,10 +1,12 @@
 {
   "name": "download-trap-guard",
-  "version": "2.0.0",
+  "version": "2.6.1",
   "private": true,
-  "description": "Browser extension — warns when a page has clickable images that trigger downloads",
+  "type": "module",
+  "description": "Browser extension — warns when a Zoho Desk ticket has clickable images that trigger downloads",
   "scripts": {
     "build": "tsc && node scripts/build.mjs",
+    "test": "npm run build && node tests/analysis.test.mjs",
     "watch": "tsc --watch"
   },
   "devDependencies": {

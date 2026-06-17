@@ -1,380 +1,435 @@
 /**
- * Download Trap Guard v2.0 — clickable images that trigger downloads
- * Zoho Desk tickets only: share.google traps, imgur lures, .zip/.exe links
+ * Download Trap Guard — content script.
+ * Runs after analysis.js sets globalThis.DTGAnalysis.
  */
 
-const EXECUTABLE_EXTENSIONS = new Set([
-  ".exe", ".msi", ".msp", ".bat", ".cmd", ".com", ".scr", ".pif",
-  ".vbs", ".vbe", ".js", ".jse", ".wsf", ".hta", ".dll", ".sys",
-  ".docm", ".xlsm", ".pptm", ".jar", ".appimage"
-]);
+interface DtgAnalysisApi {
+  analyzeNavigationTarget: (
+    url: string,
+    pageHost: string,
+    baseUrl: string,
+    context: {
+      kind: string;
+      label?: string;
+      imgSrc?: string;
+      imgWidth?: number;
+      imgHeight?: number;
+      buttonStyled?: boolean;
+      ticket?: TicketContext;
+    }
+  ) => { dangerous: boolean; reason: string; confidence: number };
+  extractUrlsFromOnclick: (onclick: string) => string[];
+  MIN_CONFIDENCE: number;
+}
 
-const ARCHIVE_EXTENSIONS = new Set([
-  ".zip", ".rar", ".7z", ".tar", ".gz", ".iso", ".dmg", ".pkg", ".apk", ".deb", ".rpm"
-]);
+interface TicketContext {
+  senderEmail?: string;
+  senderDisplayName?: string;
+  subject?: string;
+}
 
-const IMAGE_EXTENSIONS = new Set([
-  ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".ico"
-]);
+const DTG = (): DtgAnalysisApi =>
+  (globalThis as typeof globalThis & { DTGAnalysis: DtgAnalysisApi }).DTGAnalysis;
 
-const ZOHO_HOST_PATTERNS = ["desk.zoho.", "mail.zoho.", "support.zoho.", ".zohodesk.com"];
-
-const TRUSTED_LINK_HOSTS = [
-  "zoho.com", "zohocdn.com", "zohostatic.com", "zohopublic.com",
-  "zappsusercontent.com", "zohostratus.com", "zohocorpcloud.com",
-  "imgur.com", "i.imgur.com", "eviivo.com", "stayzltd.com"
-];
-
-const DOWNLOAD_TRAP_HOST_EXACT = new Set(["share.google"]);
-
-const DOWNLOAD_TRAP_HOST_CONTAINS = [
-  "share-google", "sharegoogle", "googledrive", "drive-google"
-];
-
-const SKIP_SCAN_HOSTS = [
-  "google.com", "googleusercontent.com", "gstatic.com", "ggpht.com",
-  "bing.com", "yahoo.com", "duckduckgo.com", "facebook.com", "instagram.com",
-  "twitter.com", "x.com", "youtube.com", "ytimg.com", "reddit.com",
-  "wikipedia.org", "linkedin.com", "pinterest.com", "amazon.com", "ebay.com"
-];
-
-const BANNER_ID = "dtg-warning-banner";
-const STYLE_ID = "dtg-injected-styles";
-const MIN_CONFIDENCE = 70;
 const MIN_TRAP_IMAGE_PX = 16;
+const BANNER_ID = "dtg-warning-banner";
+const DISMISS_STORAGE_KEY = "dtg_dismissed_banners";
+const MAX_BANNER_ITEMS = 10;
+const BUTTON_CLASS_RE = /\b(btn|button|cta|action|primary|submit)\b/i;
 
-let lastWarnedKey = "";
-let scanTimer: ReturnType<typeof setTimeout> | null = null;
+// ── Left sidebar / ticket list — never scan these ──────────────────────────
+const LIST_EXCLUDE =
+  '[class*="lhsPanel"], [class*="ticketList"], [class*="listView"], ' +
+  '[class*="navPanel"], [class*="leftPanel"]';
 
-interface RiskyImage {
-  link: HTMLAnchorElement;
-  image: HTMLImageElement;
+interface RiskyTarget {
+  element: HTMLElement;
   targetUrl: string;
+  displayLabel: string;   // visible text/label of the element (may differ from targetUrl)
   reason: string;
   confidence: number;
+  kind: string;
 }
+
+let lastBannerKey = "";
+let scanTimer: ReturnType<typeof setTimeout> | null = null;
+let watching = false;
+let startAttempts = 0;
+let lastWatchUrl = "";
+let lastEmailFingerprint = "";
+
+let activeHighlights: HighlightRef[] = [];
+const flaggedElements = new WeakSet<HTMLElement>();
+
+type HighlightRef = { element: HTMLElement; targetUrl: string };
+
+if (!(globalThis as typeof globalThis & { DTGAnalysis?: unknown }).DTGAnalysis) {
+  console.error("[DTG] analysis.js not loaded — disabled.");
+}
+
+// ── URL helpers ────────────────────────────────────────────────────────────
 
 function isTicketDetailsUrl(url: string): boolean {
   try {
-    const path = new URL(url).pathname.toLowerCase();
-    return (
-      /\/agent\/[^/]+\/[^/]+\/tickets\/details\//.test(path) ||
-      path.includes("/tickets/details/")
-    );
+    const p = new URL(url).pathname.toLowerCase();
+    return /\/agent\/[^/]+\/[^/]+\/tickets\/details\//.test(p) || p.includes("/tickets/details/");
   } catch {
     return false;
   }
 }
 
-function getParentUrl(): string | null {
+function isOnTicketPage(): boolean {
+  if (isTicketDetailsUrl(window.location.href)) return true;
+  // inside cross-origin iframe whose parent is a ticket page
   try {
-    if (window.parent !== window) return window.parent.location.href;
+    if (window.parent !== window) {
+      const ph = window.parent.location.href;
+      if (isTicketDetailsUrl(ph)) return true;
+    }
   } catch {
     /* cross-origin */
   }
+  // last resort: referrer
+  return Boolean(document.referrer && isTicketDetailsUrl(document.referrer));
+}
+
+function isZohoDeskFrame(): boolean {
+  const h = window.location.hostname.toLowerCase();
+  return (
+    h.includes("zohopublic") ||
+    h.includes("zappsusercontent") ||
+    h.includes("zohostratus") ||
+    h.includes("zohocdn") ||
+    h.includes("zoho.eu")
+  );
+}
+
+function shouldActivate(): boolean {
+  if (isOnTicketPage() || isZohoDeskFrame()) return true;
+  // Activate in any subframe — Zoho renders email bodies in iframes (about:blank,
+  // about:srcdoc, or cross-origin Zoho URLs) whose href doesn't match ticket patterns.
+  // The analysis confidence threshold + sidebar exclusion prevent false positives.
+  if (window !== window.top) return true;
+  return false;
+}
+
+function pageHost(): string {
+  try {
+    if (window.parent !== window) {
+      const ph = window.parent.location.href;
+      if (ph) return new URL(ph).hostname;
+    }
+  } catch {
+    /* cross-origin */
+  }
+  return window.location.hostname;
+}
+
+// ── Ticket context (sender, subject) ───────────────────────────────────────
+
+let ctxCache: TicketContext | null = null;
+let ctxTs = 0;
+
+function extractEmail(t: string): string | undefined {
+  return t.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/i)?.[0]?.toLowerCase();
+}
+
+function getTicketContext(): TicketContext {
+  const now = Date.now();
+  if (ctxCache && now - ctxTs < 4000) return ctxCache;
+  const ctx: TicketContext = {};
+
+  const subjSel =
+    '[class*="ticketSubject"],[class*="subjTitle"],[class*="subjectLine"],[class*="zd_v2-subject"]';
+  for (const el of Array.from(document.querySelectorAll(subjSel))) {
+    const t = el.textContent?.trim();
+    if (t && t.length > 4 && t.length < 400) { ctx.subject = t.replace(/\s+/g, " ").slice(0, 300); break; }
+  }
+  if (!ctx.subject && document.title) {
+    const t = document.title.replace(/^Ticket\s*#?\d+\s*[-–:|]\s*/i, "").replace(/\s*[-–|]\s*(Zoho|Desk).*$/i, "").trim();
+    if (t.length > 4) ctx.subject = t.slice(0, 300);
+  }
+
+  const mailSel = '[class*="requesterMail"],[class*="fromMail"],[class*="senderEmail"],[class*="fromEmail"]';
+  for (const el of Array.from(document.querySelectorAll(mailSel))) {
+    const e = extractEmail(el.textContent ?? "");
+    if (e) { ctx.senderEmail = e; break; }
+  }
+  if (!ctx.senderEmail) {
+    for (const el of Array.from(document.querySelectorAll('a[href^="mailto:"]'))) {
+      const e = extractEmail(el.getAttribute("href")?.replace(/^mailto:/i, "").split("?")[0] ?? "");
+      if (e) { ctx.senderEmail = e; break; }
+    }
+  }
+
+  ctxCache = ctx; ctxTs = now; return ctx;
+}
+
+function ctx(partial: Record<string, unknown>): Record<string, unknown> {
+  return { ...partial, ticket: getTicketContext() };
+}
+
+// ── Element helpers ────────────────────────────────────────────────────────
+
+/**
+ * Extract the real destination URL from a redirect/tracking wrapper.
+ * Handles Google (google.com/url?q=...) and Zoho link-protect wrappers,
+ * which are common when Gmail-sent phishing emails are rendered in Zoho Desk.
+ */
+function unwrapRedirectUrl(url: string): string | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    // Google redirect: https://www.google.com/url?q=<encoded-real-url>&...
+    if (
+      (u.hostname === "www.google.com" || u.hostname === "google.com") &&
+      u.pathname === "/url"
+    ) {
+      const q = u.searchParams.get("q") || u.searchParams.get("url");
+      if (q && /^https?:\/\//i.test(q)) return q;
+    }
+    // Zoho link-protect: https://mail.zoho.com/link-protect?url=<encoded-real-url>&...
+    if (u.hostname.endsWith(".zoho.com") && u.pathname.includes("link-protect")) {
+      const q = u.searchParams.get("url");
+      if (q && /^https?:\/\//i.test(q)) return q;
+    }
+  } catch { /* ignore */ }
   return null;
 }
 
-function queryAllDeep(selector: string): Element[] {
-  const results: Element[] = [];
+function getLinkUrl(a: HTMLAnchorElement): string {
+  const raw = a.getAttribute("href")?.trim() || a.href;
+  if (!raw || raw === "#") return "";
 
-  function walk(node: Node): void {
-    if (node instanceof Element) {
-      if (node.matches(selector) && !results.includes(node)) results.push(node);
-      node.querySelectorAll(selector).forEach((el) => {
-        if (!results.includes(el)) results.push(el);
-      });
-      if (node.shadowRoot) walk(node.shadowRoot);
-    }
-    node.childNodes.forEach(walk);
+  // Try to unwrap Google / Zoho redirect wrappers.
+  // Also check data-saferedirecturl (Gmail's safe-redirect attribute preserves the real URL).
+  return (
+    unwrapRedirectUrl(raw) ??
+    unwrapRedirectUrl(a.getAttribute("data-saferedirecturl") ?? "") ??
+    raw
+  );
+}
+
+function isIgnorableHref(h: string): boolean {
+  if (!h || h === "#") return true;
+  const l = h.toLowerCase();
+  return l.startsWith("javascript:") || l.startsWith("mailto:") || l.startsWith("tel:");
+}
+
+function getLabel(el: HTMLElement): string {
+  const inner = el.querySelector("button, input[type='button'], input[type='submit']");
+  if (inner instanceof HTMLElement) {
+    const t = inner.getAttribute("aria-label")?.trim() || inner.textContent?.trim();
+    if (t) return t.replace(/\s+/g, " ").slice(0, 120);
   }
-
-  walk(document.documentElement);
-  return results;
+  const aria = el.getAttribute("aria-label")?.trim();
+  if (aria) return aria;
+  return (el.textContent?.trim().replace(/\s+/g, " ") ?? "").slice(0, 120);
 }
 
-function queryAllAnchorsDeep(): HTMLAnchorElement[] {
-  const anchors: HTMLAnchorElement[] = [];
-
-  function walk(node: Node): void {
-    if (node instanceof HTMLAnchorElement && node.hasAttribute("href")) {
-      anchors.push(node);
-    }
-    if (node instanceof Element && node.shadowRoot) walk(node.shadowRoot);
-    node.childNodes.forEach(walk);
-  }
-
-  walk(document.documentElement);
-  return anchors;
-}
-
-function hasZohoDeskDom(): boolean {
-  return queryAllDeep('[class*="zd_v2-richtextcontent"], [class*="thrdPlain"]').length > 0;
-}
-
-function isZohoDeskContext(): boolean {
-  if (isTicketDetailsUrl(window.location.href)) return true;
-  const parent = getParentUrl();
-  if (parent && isTicketDetailsUrl(parent)) return true;
-  if (hasZohoDeskDom()) return true;
-  return ZOHO_HOST_PATTERNS.some((p) => window.location.hostname.toLowerCase().includes(p));
-}
-
-function isInsideTicketContent(el: Element): boolean {
-  if (el.closest('[class*="richtextcontent"]')) return true;
-  if (el.closest('[class*="thrdPlain"]')) return true;
-  if (el.closest('[class*="contentwrapper"]')) return true;
-  if (el.closest('[class*="threadContent"]')) return true;
-  if (el.closest('[class*="CommentContent"]')) return true;
-  return false;
-}
-
-function hostMatches(host: string, pattern: string): boolean {
-  const h = host.toLowerCase();
-  if (pattern.endsWith(".")) return h.includes(pattern);
-  return h === pattern || h.endsWith("." + pattern);
-}
-
-function shouldSkipPage(): boolean {
-  if (isZohoDeskContext()) return false;
-  const host = window.location.hostname.toLowerCase();
-  if (SKIP_SCAN_HOSTS.some((p) => hostMatches(host, p))) return true;
-  return false;
-}
-
-function getBannerDocument(): Document {
+function isButtonStyled(a: HTMLAnchorElement): boolean {
+  if (a.querySelector("button, input[type='button'], input[type='submit']")) return true;
+  if (BUTTON_CLASS_RE.test(a.className?.toString() ?? "")) return true;
+  if (a.getAttribute("role") === "button") return true;
+  const s = a.getAttribute("style") ?? "";
+  if (/background(-color)?\s*:/i.test(s) && (/padding/i.test(s) || /border-radius/i.test(s))) return true;
   try {
-    if (window.top?.document?.documentElement) return window.top.document;
-  } catch {
-    /* cross-origin */
-  }
-  return document;
-}
-
-function isPortalInternalHost(hostname: string): boolean {
-  const h = hostname.toLowerCase();
-  const pageHost = window.location.hostname.toLowerCase();
-  if (h === pageHost) return true;
-  if (h.endsWith("." + pageHost)) return true;
-  const pageBase = pageHost.split(".").slice(-2).join(".");
-  if (pageBase.length > 3 && h.endsWith("." + pageBase)) return true;
+    const bg = getComputedStyle(a).backgroundColor;
+    const pad = parseFloat(getComputedStyle(a).paddingLeft);
+    if (bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent" && pad >= 4) return true;
+  } catch { /* ignore */ }
   return false;
 }
 
-function isTrustedHost(hostname: string): boolean {
-  if (isPortalInternalHost(hostname)) return true;
-  return TRUSTED_LINK_HOSTS.some((t) => {
-    const h = hostname.toLowerCase();
-    return h === t || h.endsWith("." + t);
-  });
-}
-
-function extensionFromPath(pathname: string): string | null {
-  const segment = pathname.split("/").pop()?.split("?")[0] ?? "";
-  const dot = segment.lastIndexOf(".");
-  if (dot <= 0) return null;
-  return segment.slice(dot).toLowerCase();
-}
-
-function isDownloadExtension(ext: string): boolean {
-  return EXECUTABLE_EXTENSIONS.has(ext) || ARCHIVE_EXTENSIONS.has(ext);
-}
-
-function isImagePreviewUrl(parsed: URL): boolean {
-  const ext = extensionFromPath(parsed.pathname);
-  if (ext && IMAGE_EXTENSIONS.has(ext)) return true;
-  return /\.(jpe?g|png|gif|webp|svg)(\?|$)/i.test(parsed.pathname);
-}
-
-function checkDownloadTrapHost(hostname: string): { dangerous: boolean; reason: string; confidence: number } {
-  const host = hostname.toLowerCase();
-
-  if (DOWNLOAD_TRAP_HOST_EXACT.has(host)) {
-    return {
-      dangerous: true,
-      reason: `Image links to "${host}" — known to download a file when clicked`,
-      confidence: 98
-    };
-  }
-
-  for (const fragment of DOWNLOAD_TRAP_HOST_CONTAINS) {
-    if (host.includes(fragment)) {
-      return {
-        dangerous: true,
-        reason: `Image links to "${host}" — may download a file when clicked`,
-        confidence: 92
-      };
-    }
-  }
-
-  return { dangerous: false, reason: "", confidence: 0 };
-}
-
-function getLinkUrl(anchor: HTMLAnchorElement): string {
-  return anchor.getAttribute("href")?.trim() || anchor.href;
-}
-
-function getImageSize(img: HTMLImageElement): { w: number; h: number } {
+function getImgSize(img: HTMLImageElement): { w: number; h: number } {
+  const rect = img.getBoundingClientRect();
   return {
-    w: img.width || img.naturalWidth || img.offsetWidth || 0,
-    h: img.height || img.naturalHeight || img.offsetHeight || 0
+    w: img.width || img.naturalWidth || img.offsetWidth || Math.round(rect.width) || 0,
+    h: img.height || img.naturalHeight || img.offsetHeight || Math.round(rect.height) || 0
   };
 }
 
 function isTrackingPixel(img: HTMLImageElement): boolean {
-  const { w, h } = getImageSize(img);
+  const { w, h } = getImgSize(img);
   return w > 0 && h > 0 && w < MIN_TRAP_IMAGE_PX && h < MIN_TRAP_IMAGE_PX;
 }
 
-function analyzeImageLink(
+function resolveButtonUrls(el: HTMLElement): string[] {
+  const urls: string[] = [];
+  if ((el instanceof HTMLButtonElement || el instanceof HTMLInputElement) && el.formAction) urls.push(el.formAction);
+  const pa = el.closest("a[href]");
+  if (pa instanceof HTMLAnchorElement) urls.push(getLinkUrl(pa));
+  const oc = el.getAttribute("onclick");
+  if (oc) urls.push(...DTG().extractUrlsFromOnclick(oc));
+  const dh = el.getAttribute("data-href") || el.getAttribute("data-url") || el.getAttribute("data-saferedirecturl");
+  if (dh) urls.push(dh);
+  return [...new Set(urls.filter(Boolean))];
+}
+
+// ── In-list-panel guard (only thing we skip) ──────────────────────────────
+
+function inListPanel(el: Element): boolean {
+  return Boolean(el.closest(LIST_EXCLUDE));
+}
+
+// ── DOM walkers ────────────────────────────────────────────────────────────
+
+function allAnchorsIn(root: Node): HTMLAnchorElement[] {
+  const out: HTMLAnchorElement[] = [];
+  const seen = new Set<HTMLAnchorElement>();
+  function walk(n: Node): void {
+    if (n instanceof HTMLAnchorElement) {
+      const h = n.getAttribute("href") ?? n.href;
+      if (h && !isIgnorableHref(h) && !seen.has(n)) { seen.add(n); out.push(n); }
+    }
+    if (n instanceof HTMLIFrameElement) {
+      try { const d = n.contentDocument; if (d?.body) walk(d.body); } catch { /* cross-origin */ }
+    }
+    if (n instanceof Element && n.shadowRoot) walk(n.shadowRoot);
+    n.childNodes.forEach(walk);
+  }
+  walk(root);
+  return out;
+}
+
+function allButtonsIn(root: Node): HTMLElement[] {
+  const out: HTMLElement[] = [];
+  const seen = new Set<HTMLElement>();
+  function walk(n: Node): void {
+    if (n instanceof HTMLElement) {
+      const isBtn = n instanceof HTMLButtonElement ||
+        (n instanceof HTMLInputElement && (n.type === "button" || n.type === "submit"));
+      if (isBtn && !seen.has(n)) { seen.add(n); out.push(n); }
+      if (n instanceof HTMLIFrameElement) {
+        try { const d = n.contentDocument; if (d?.body) walk(d.body); } catch { /* cross-origin */ }
+      }
+      if (n.shadowRoot) walk(n.shadowRoot);
+    }
+    n.childNodes.forEach(walk);
+  }
+  walk(root);
+  return out;
+}
+
+// ── Risk analysis ──────────────────────────────────────────────────────────
+
+function pushRisk(
+  seen: Set<string>,
+  risks: RiskyTarget[],
+  el: HTMLElement,
   url: string,
-  img: HTMLImageElement
-): { dangerous: boolean; reason: string; confidence: number } {
-  if (!url || url.startsWith("javascript:") || url.startsWith("data:") || url.startsWith("mailto:")) {
-    return { dangerous: false, reason: "", confidence: 0 };
+  analysis: { dangerous: boolean; reason: string; confidence: number },
+  kind: string
+): void {
+  if (!analysis.dangerous || analysis.confidence < DTG().MIN_CONFIDENCE) return;
+  if (inListPanel(el)) return;
+  const label = getLabel(el);
+  const key = `${kind}|${url}|${el.tagName}|${label}`;
+  if (seen.has(key)) return;
+  seen.add(key);
+  risks.push({ element: el, targetUrl: url, displayLabel: label, reason: analysis.reason, confidence: analysis.confidence, kind });
+}
+
+function analyzeAnchor(a: HTMLAnchorElement, host: string, seen: Set<string>, risks: RiskyTarget[]): void {
+  const url = getLinkUrl(a);
+  if (isIgnorableHref(url)) return;
+  const label = getLabel(a);
+  const btnStyled = isButtonStyled(a);
+  const imgs = Array.from(a.querySelectorAll("img")).filter((i): i is HTMLImageElement => i instanceof HTMLImageElement);
+
+  if (imgs.length > 0) {
+    let analyzed = false;
+    for (const img of imgs) {
+      if (isTrackingPixel(img)) continue;
+      analyzed = true;
+      const { w, h } = getImgSize(img);
+      const r = DTG().analyzeNavigationTarget(url, host, window.location.href,
+        ctx({ kind: "image-link", imgSrc: img.src, imgWidth: w, imgHeight: h, label, buttonStyled: btnStyled }) as never);
+      pushRisk(seen, risks, a, url, r, "image-link");
+    }
+    if (analyzed) return;
   }
 
-  try {
-    const parsed = new URL(url, window.location.href);
-    const host = parsed.hostname.toLowerCase();
+  const kind = btnStyled ? "button-link" : "text-link";
+  const r = DTG().analyzeNavigationTarget(url, host, window.location.href,
+    ctx({ kind, label, buttonStyled: btnStyled }) as never);
+  pushRisk(seen, risks, a, url, r, kind);
+}
 
-    const trapHost = checkDownloadTrapHost(host);
-    if (trapHost.dangerous) return trapHost;
-
-    const pathExt = extensionFromPath(parsed.pathname);
-    if (pathExt && isDownloadExtension(pathExt)) {
-      return {
-        dangerous: true,
-        reason: `Image click downloads a ${pathExt} file`,
-        confidence: 96
-      };
-    }
-
-    let imgHost = "";
-    try {
-      imgHost = new URL(img.src).hostname.toLowerCase();
-    } catch {
-      /* ignore */
-    }
-
-    // Imgur preview image wrapping a non-image download link
-    if (
-      imgHost.includes("imgur.com") &&
-      !isTrustedHost(host) &&
-      !isImagePreviewUrl(parsed)
-    ) {
-      return {
-        dangerous: true,
-        reason: `Imgur image click goes to ${host} — may download malware`,
-        confidence: 95
-      };
-    }
-
-    return { dangerous: false, reason: "", confidence: 0 };
-  } catch {
-    return { dangerous: false, reason: "", confidence: 0 };
+function analyzeButton(el: HTMLElement, host: string, seen: Set<string>, risks: RiskyTarget[]): void {
+  const label = getLabel(el);
+  for (const url of resolveButtonUrls(el)) {
+    const r = DTG().analyzeNavigationTarget(url, host, window.location.href,
+      ctx({ kind: "button-element", label, buttonStyled: true }) as never);
+    pushRisk(seen, risks, el, url, r, "button-element");
   }
 }
 
-function findRiskyImages(): RiskyImage[] {
-  const risks: RiskyImage[] = [];
-  const seen = new Set<string>();
+function scanRoot(root: Element, host: string, seen: Set<string>, risks: RiskyTarget[]): void {
+  const anchorsSeen = new Set<HTMLAnchorElement>();
+  const btnSeen = new Set<HTMLElement>();
 
-  if (!isZohoDeskContext()) return [];
+  for (const a of allAnchorsIn(root)) {
+    if (anchorsSeen.has(a)) continue;
+    anchorsSeen.add(a);
+    analyzeAnchor(a, host, seen, risks);
+  }
 
-  for (const anchor of queryAllAnchorsDeep()) {
-    if (!isInsideTicketContent(anchor)) continue;
+  for (const btn of allButtonsIn(root)) {
+    if (btnSeen.has(btn)) continue;
+    btnSeen.add(btn);
+    if (btn.closest("a[href]") instanceof HTMLAnchorElement) continue;
+    analyzeButton(btn, host, seen, risks);
+  }
 
-    const img = anchor.querySelector("img");
-    if (!(img instanceof HTMLImageElement)) continue;
-    if (isTrackingPixel(img)) continue;
-
-    const targetUrl = getLinkUrl(anchor);
-    const analysis = analyzeImageLink(targetUrl, img);
-    if (!analysis.dangerous || analysis.confidence < MIN_CONFIDENCE) continue;
-
-    const key = targetUrl + "|" + img.src;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    risks.push({
-      link: anchor,
-      image: img,
-      targetUrl,
-      reason: analysis.reason,
-      confidence: analysis.confidence
+  // Fast path: directly query known trap URLs
+  for (const sel of ['a[href*="share.google"]', 'a[href*="share-google"]', '[data-href*="share.google"]']) {
+    root.querySelectorAll(sel).forEach((node) => {
+      if (!(node instanceof HTMLAnchorElement) || anchorsSeen.has(node)) return;
+      if (inListPanel(node)) return;
+      anchorsSeen.add(node);
+      analyzeAnchor(node, host, seen, risks);
     });
   }
+
+  // Clickable images not inside <a>
+  root.querySelectorAll("img").forEach((node) => {
+    if (!(node instanceof HTMLImageElement)) return;
+    if (isTrackingPixel(node)) return;
+    if (node.closest("a[href]")) return;
+    let el: HTMLElement | null = node;
+    for (let d = 0; el && d < 6; d++, el = el.parentElement) {
+      const dh = el.getAttribute("data-href") || el.getAttribute("data-url") || el.getAttribute("onclick");
+      if (!dh) continue;
+      const urls = dh.startsWith("http") ? [dh] : DTG().extractUrlsFromOnclick(dh);
+      for (const url of urls) {
+        const { w, h } = getImgSize(node);
+        const r = DTG().analyzeNavigationTarget(url, host, window.location.href,
+          ctx({ kind: "image-link", imgSrc: node.src, imgWidth: w, imgHeight: h, label: getLabel(el) }) as never);
+        if (r.dangerous) { pushRisk(seen, risks, el, url, r, "image-link"); return; }
+      }
+    }
+  });
+}
+
+function findRiskyTargets(): RiskyTarget[] {
+  if (!shouldActivate()) return [];
+  if (!DTG()) return [];
+
+  const seen = new Set<string>();
+  const risks: RiskyTarget[] = [];
+  const host = pageHost();
+
+  scanRoot(document.body, host, seen, risks);
 
   return risks.sort((a, b) => b.confidence - a.confidence);
 }
 
-function injectBannerStyles(doc: Document): void {
-  if (doc.getElementById(STYLE_ID)) return;
-  const style = doc.createElement("style");
-  style.id = STYLE_ID;
-  style.textContent = `
-    #${BANNER_ID}{position:fixed;top:0;left:0;right:0;z-index:2147483647;font-family:system-ui,sans-serif;font-size:14px;box-shadow:0 4px 24px rgba(0,0,0,.3)}
-    #${BANNER_ID} .dtg-inner{display:flex;gap:12px;background:linear-gradient(135deg,#7f1d1d,#991b1b);color:#fff;padding:14px 18px;border-bottom:3px solid #fca5a5}
-    #${BANNER_ID} .dtg-text strong{display:block;font-size:15px;margin-bottom:4px}
-    #${BANNER_ID} .dtg-text p{margin:0 0 8px;line-height:1.4}
-    #${BANNER_ID} .dtg-list{margin:0;padding-left:18px;font-size:13px}
-    #${BANNER_ID} .dtg-list code{background:rgba(0,0,0,.25);padding:1px 4px;border-radius:3px;font-size:12px}
-    #${BANNER_ID} .dtg-dismiss{margin-left:auto;background:rgba(255,255,255,.15);border:none;color:#fff;width:32px;height:32px;border-radius:6px;cursor:pointer;font-size:16px}
-    img.dtg-highlight{outline:3px solid #ef4444!important;outline-offset:2px;box-shadow:0 0 0 6px rgba(239,68,68,.4)!important}
-    a.dtg-highlight-link{outline:3px solid #ef4444!important;outline-offset:3px;box-shadow:0 0 12px rgba(239,68,68,.6)!important;background:rgba(239,68,68,.15)!important}
-  `;
-  doc.head.appendChild(style);
-}
+// ── Banner ─────────────────────────────────────────────────────────────────
 
-function clearWarnings(): void {
-  try {
-    getBannerDocument().getElementById(BANNER_ID)?.remove();
-  } catch {
-    /* ignore */
-  }
-  document.getElementById(BANNER_ID)?.remove();
-
-  queryAllAnchorsDeep().forEach((a) => a.classList.remove("dtg-highlight-link"));
-  queryAllDeep("img.dtg-highlight").forEach((img) => img.classList.remove("dtg-highlight"));
-}
-
-function showBanner(risks: RiskyImage[]): void {
-  clearWarnings();
-
-  const bannerDoc = getBannerDocument();
-  injectBannerStyles(bannerDoc);
-
-  const banner = bannerDoc.createElement("div");
-  banner.id = BANNER_ID;
-  banner.setAttribute("role", "alert");
-  banner.innerHTML = `
-    <div class="dtg-inner">
-      <div style="font-size:28px">⚠️</div>
-      <div class="dtg-text">
-        <strong>Download trap — do not click this image</strong>
-        <p>This ticket has a clickable image that may download malware (.zip or similar). Do not click.</p>
-        <ul class="dtg-list">
-          ${risks
-            .slice(0, 3)
-            .map(
-              (r) =>
-                `<li>${escapeHtml(r.reason)} → <code>${escapeHtml(shortUrl(r.targetUrl))}</code></li>`
-            )
-            .join("")}
-        </ul>
-      </div>
-      <button type="button" class="dtg-dismiss" aria-label="Dismiss">✕</button>
-    </div>
-  `;
-
-  banner.querySelector(".dtg-dismiss")?.addEventListener("click", () => clearWarnings());
-  bannerDoc.documentElement.prepend(banner);
-
-  risks.forEach((r) => {
-    r.image.classList.add("dtg-highlight");
-    r.link.classList.add("dtg-highlight-link");
-  });
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 function shortUrl(url: string): string {
@@ -382,82 +437,307 @@ function shortUrl(url: string): string {
     const u = new URL(url);
     const q = u.search ? u.search.slice(0, 30) + (u.search.length > 30 ? "…" : "") : "";
     return u.hostname + u.pathname + q;
-  } catch {
-    return url.slice(0, 60);
-  }
+  } catch { return url.slice(0, 60); }
 }
 
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+function bannerKey(risks: RiskyTarget[]): string {
+  return risks.map((r) => `${r.kind}|${r.targetUrl}|${getLabel(r.element)}`).sort().join("||");
 }
 
-function scanAndWarn(): void {
-  if (shouldSkipPage()) {
-    clearWarnings();
-    return;
+async function isBannerDismissed(key: string): Promise<boolean> {
+  try {
+    const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
+    return Boolean((d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined)?.[key]);
+  } catch { return false; }
+}
+
+async function rememberDismissed(key: string): Promise<void> {
+  try {
+    const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
+    const map = (d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined) ?? {};
+    map[key] = Date.now();
+    await chrome.storage.session.set({ [DISMISS_STORAGE_KEY]: map });
+  } catch { /* ignore */ }
+}
+
+function applyHighlights(risks: RiskyTarget[]): void {
+  const uniq = new Map<HTMLElement, string>();
+  for (const r of risks) uniq.set(r.element, r.targetUrl);
+  activeHighlights = Array.from(uniq.entries()).map(([element, targetUrl]) => ({ element, targetUrl }));
+  activeHighlights.forEach(({ element: el, targetUrl }) => {
+    if (!targetUrl) return;
+    if (el instanceof HTMLAnchorElement || el.tagName === "A") el.classList.add("dtg-highlight-link");
+    else el.classList.add("dtg-highlight-button");
+    el.querySelectorAll("img").forEach((img) => img.classList.add("dtg-highlight"));
+    flaggedElements.add(el);
+  });
+}
+
+function clearWarnings(opts?: { removeHighlights?: boolean }): void {
+  document.querySelectorAll(`#${BANNER_ID}`).forEach((el) => el.remove());
+  if (opts?.removeHighlights === false) return;
+  for (const { element: el } of activeHighlights) {
+    try {
+      el.classList.remove("dtg-highlight-link", "dtg-highlight-button");
+      el.querySelectorAll("img").forEach((img) => img.classList.remove("dtg-highlight"));
+      flaggedElements.delete(el);
+    } catch { /* ignore */ }
+  }
+  activeHighlights = [];
+}
+
+async function showBanner(risks: RiskyTarget[]): Promise<void> {
+  applyHighlights(risks);
+
+  const key = bannerKey(risks);
+  if (key === lastBannerKey) return;
+  if (await isBannerDismissed(key)) return;
+  lastBannerKey = key;
+
+  document.querySelectorAll(`#${BANNER_ID}`).forEach((el) => el.remove());
+
+  const extra = risks.length > MAX_BANNER_ITEMS ? risks.length - MAX_BANNER_ITEMS : 0;
+  const banner = document.createElement("div");
+  banner.id = BANNER_ID;
+  banner.setAttribute("role", "alert");
+
+  function riskRow(r: RiskyTarget): string {
+    const realUrl = escapeHtml(r.targetUrl);
+    // Show the deceptive display text only when it differs meaningfully from the real URL
+    const labelText = r.displayLabel.trim();
+    const labelIsUrl = /^https?:\/\//i.test(labelText);
+    const labelDiffers = labelText && !r.targetUrl.toLowerCase().includes(labelText.toLowerCase().slice(0, 20));
+    const labelHtml = labelIsUrl && labelDiffers
+      ? `<span class="dtg-fake-url">Shown as: <code>${escapeHtml(labelText.slice(0, 120))}</code></span>`
+      : "";
+    return `<li>
+      <span class="dtg-reason">${escapeHtml(r.reason)}</span>
+      ${labelHtml}
+      <span class="dtg-dest">Real link: <code class="dtg-url-code">${realUrl}</code></span>
+    </li>`;
   }
 
-  const risks = findRiskyImages();
-  if (risks.length === 0) {
+  banner.innerHTML = `
+    <div class="dtg-inner">
+      <div class="dtg-icon" aria-hidden="true">!</div>
+      <div class="dtg-text">
+        <strong>Download trap — do not click</strong>
+        <p>This email has ${risks.length} suspicious item${risks.length === 1 ? "" : "s"} that may download malware. Do not click.</p>
+        <ul class="dtg-list">
+          ${risks.slice(0, MAX_BANNER_ITEMS).map(riskRow).join("")}
+          ${extra > 0 ? `<li>…and ${extra} more</li>` : ""}
+        </ul>
+      </div>
+      <button type="button" class="dtg-dismiss" aria-label="Dismiss">✕</button>
+    </div>`;
+
+  banner.querySelector(".dtg-dismiss")?.addEventListener("click", () => {
+    void rememberDismissed(key);
+    clearWarnings({ removeHighlights: false });
+  });
+
+  // Insert inside the email content area if we can find it, else prepend to body
+  const insertTarget = findEmailInsertPoint() ?? document.body;
+  insertTarget.insertBefore(banner, insertTarget.firstChild);
+}
+
+/** Find the best container to insert the banner into (inside the email, not the Zoho chrome). */
+function findEmailInsertPoint(): HTMLElement | null {
+  const MARKERS = [
+    '[class*="mailContent"]', '[class*="mailWrapper"]', '[class*="mailCont"]',
+    '[class*="thrdPlain"]', '[class*="richtext"]', '[class*="zd_v2-richtext"]',
+    '[class*="msgContent"]', '[class*="emailContent"]', '[class*="threadBody"]',
+    '[class*="threadContent"]', '[class*="contentArea"]', '[class*="rhsPanel"]',
+    '[class*="threadDetail"]', '[class*="conversation"]'
+  ];
+  for (const sel of MARKERS) {
+    const el = document.querySelector(sel);
+    if (el instanceof HTMLElement && !el.closest(LIST_EXCLUDE)) return el;
+  }
+  // try iframes
+  for (const frame of Array.from(document.querySelectorAll("iframe"))) {
+    try {
+      const doc = (frame as HTMLIFrameElement).contentDocument;
+      if (!doc?.body) continue;
+      for (const sel of MARKERS) {
+        const el = doc.querySelector(sel);
+        if (el instanceof HTMLElement) return el;
+      }
+      if (doc.body.children.length > 0) return doc.body;
+    } catch { /* cross-origin */ }
+  }
+  return null;
+}
+
+// ── Main scan loop ─────────────────────────────────────────────────────────
+
+/**
+ * Build a short fingerprint of the visible email body so we can detect when
+ * Zoho silently loads a different conversation without changing the tab URL
+ * (common in the multi-conversation ticket view).
+ */
+function emailFingerprint(): string {
+  // Prefer the dedicated email content container; fall back to the ticket-detail RHS panel.
+  const EMAIL_SELECTORS = [
+    '[class*="mailContent"]', '[class*="mailWrapper"]', '[class*="thrdPlain"]',
+    '[class*="msgContent"]', '[class*="emailContent"]', '[class*="threadBody"]',
+    '[class*="richtext"]', '[class*="threadDetail"]', '[class*="conversation"]'
+  ];
+  for (const sel of EMAIL_SELECTORS) {
+    const el = document.querySelector(sel);
+    if (el && !el.closest(LIST_EXCLUDE)) {
+      const t = el.textContent?.replace(/\s+/g, " ").trim().slice(0, 200) ?? "";
+      if (t.length > 20) return t;
+    }
+  }
+  return "";
+}
+
+async function scanAndWarn(): Promise<void> {
+  if (!shouldActivate()) return;
+
+  // Detect when Zoho switches to a different conversation (same URL, different content).
+  const fp = emailFingerprint();
+  if (fp && fp !== lastEmailFingerprint) {
+    lastEmailFingerprint = fp;
+    ctxCache = null; ctxTs = 0;
     clearWarnings();
-    return;
+    lastBannerKey = "";
   }
 
-  showBanner(risks);
+  const risks = findRiskyTargets();
+  if (risks.length === 0) return;
 
-  const key = risks.map((r) => r.targetUrl).join("|");
-  if (key === lastWarnedKey) return;
-  lastWarnedKey = key;
+  await showBanner(risks);
+
+  try {
+    chrome.runtime.sendMessage({
+      type: "DOWNLOAD_TRAP_DETECTED",
+      count: risks.length,
+      url: window.location.href,
+      frame: window !== window.top
+    });
+  } catch { /* ignore */ }
 }
 
 function scheduleScan(): void {
   if (scanTimer) clearTimeout(scanTimer);
-  scanTimer = setTimeout(scanAndWarn, 300);
+  scanTimer = setTimeout(() => void scanAndWarn(), 350);
+}
+
+function onRouteChange(): void {
+  const url = location.href;
+  if (url === lastWatchUrl) return;
+  lastWatchUrl = url;
+  ctxCache = null; ctxTs = 0;
+  clearWarnings();
+  lastBannerKey = "";
+  if (!watching) { startAttempts = 0; startWatching(); }
+  else void scanAndWarn();
 }
 
 function startWatching(): void {
-  scheduleScan();
+  if (watching) return;
+  if (!DTG()) return;
+  if (!shouldActivate()) {
+    if (startAttempts++ < 60) setTimeout(startWatching, 800);
+    return;
+  }
+
+  watching = true;
+  lastWatchUrl = location.href;
+  console.info("[DTG] watching:", location.href);
+
+  void scanAndWarn();
+
   new MutationObserver(scheduleScan).observe(document.documentElement, {
-    childList: true,
-    subtree: true
+    childList: true, subtree: true, attributes: true,
+    attributeFilter: ["href", "src", "onclick", "formaction", "data-href", "data-url"]
   });
 
-  if (isZohoDeskContext()) {
-    let ticks = 0;
-    const interval = setInterval(() => {
-      scanAndWarn();
-      if (++ticks >= 30) clearInterval(interval);
-    }, 2000);
+  setInterval(() => void scanAndWarn(), 5000);
+  setInterval(onRouteChange, 1500);
+
+  // Delayed scans — email content in Zoho often loads 1-5s after document_idle
+  for (const ms of [300, 800, 1500, 2500, 4000, 7000, 12000, 20000]) {
+    setTimeout(() => void scanAndWarn(), ms);
+  }
+
+  // Attach to iframes when they load
+  const attachFrame = (frame: HTMLIFrameElement): void => {
+    frame.addEventListener("load", () => { setTimeout(() => void scanAndWarn(), 300); });
+    setTimeout(() => void scanAndWarn(), 800);
+  };
+  document.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
+  new MutationObserver((muts) => {
+    for (const m of muts) m.addedNodes.forEach((n) => {
+      if (n instanceof HTMLIFrameElement) attachFrame(n);
+      if (n instanceof Element) n.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
+    });
+  }).observe(document.documentElement, { childList: true, subtree: true });
+}
+
+// Expose rescan hook so the IIFE guard can call it on re-injection
+(globalThis as typeof globalThis & { __dtgRescan?: () => void }).__dtgRescan = () => {
+  ctxCache = null;
+  ctxTs = 0;
+  lastBannerKey = "";
+  lastEmailFingerprint = "";
+  void scanAndWarn();
+};
+
+// Boot
+{
+  const g = globalThis as typeof globalThis & { __dtgInit?: boolean };
+  if (!g.__dtgInit) {
+    g.__dtgInit = true;
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", startWatching);
+    else startWatching();
   }
 }
 
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", startWatching);
-} else {
-  startWatching();
-}
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === "DTG_CLEAR_BANNER") { clearWarnings(); lastBannerKey = ""; }
+});
 
-function blockClick(e: Event): void {
-  const target = e.target as Element | null;
-  const flagged = target?.closest("a.dtg-highlight-link, img.dtg-highlight");
-  if (!flagged) return;
+// ── Click / keyboard blocking ──────────────────────────────────────────────
 
-  const link = (flagged.closest("a") ?? flagged) as HTMLAnchorElement;
-  const dest = link.href ? getLinkUrl(link) : "";
-
-  const ok = window.confirm(
-    "⚠️ DOWNLOAD TRAP WARNING\n\n" +
-      "This image may download malware (.zip or similar) when clicked.\n\n" +
-      (dest ? `Link: ${dest}\n\n` : "") +
-      "Do NOT click unless you verified the sender.\n\nContinue anyway?"
+function getFlagged(target: Element | null): { el: HTMLElement; url: string } | null {
+  if (!target) return null;
+  const flagged = target.closest(
+    "a.dtg-highlight-link, .dtg-highlight-button, img.dtg-highlight"
   );
-
-  if (!ok) {
-    e.preventDefault();
-    e.stopPropagation();
-    e.stopImmediatePropagation();
-  }
+  if (!flagged) return null;
+  const el =
+    flagged instanceof HTMLAnchorElement ? flagged :
+    flagged.closest("a.dtg-highlight-link") as HTMLElement ??
+    flagged.closest(".dtg-highlight-button") as HTMLElement ??
+    (flagged instanceof HTMLElement ? flagged : null);
+  if (!el) return null;
+  const ref = activeHighlights.find((h) => h.element === el);
+  const url = ref?.targetUrl ?? (el instanceof HTMLAnchorElement ? getLinkUrl(el) : resolveButtonUrls(el)[0] ?? "");
+  return { el, url };
 }
 
-document.addEventListener("click", blockClick, true);
-document.addEventListener("auxclick", blockClick, true);
+function block(e: Event, dest: string): void {
+  if (window.confirm(
+    "DOWNLOAD TRAP WARNING\n\nThis may download malware when clicked.\n\n" +
+    (dest ? `Destination: ${dest}\n\n` : "") +
+    "Continue anyway?"
+  )) return;
+  e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+}
+
+document.addEventListener("click", (e) => { const h = getFlagged(e.target as Element); if (h) block(e, h.url); }, true);
+document.addEventListener("auxclick", (e) => { const h = getFlagged(e.target as Element); if (h) block(e, h.url); }, true);
+document.addEventListener("contextmenu", (e) => {
+  const h = getFlagged(e.target as Element);
+  if (!h) return;
+  e.preventDefault();
+  window.alert(`Download trap: do not open this link.\nDestination: ${h.url}`);
+}, true);
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const h = getFlagged(e.target as Element);
+  if (h) block(e, h.url);
+}, true);

@@ -1,6 +1,6 @@
 # Download Trap Guard
 
-Simple browser extension — warns when a website or **Zoho Desk email** contains a **clickable image** that would **download a file**.
+Simple browser extension — warns when a **Zoho Desk ticket** contains a **clickable image** that would **download a file**.
 
 No backend. No Docker. No database.
 
@@ -10,7 +10,7 @@ No backend. No Docker. No database.
 
 1. Install **Node.js** from https://nodejs.org (LTS is fine)
 
-2. Open PowerShell in this folder (`E:\typescript`):
+2. Open a terminal in this project folder:
 
 ```powershell
 npm install
@@ -26,9 +26,7 @@ npm run build
 5. Click **Load unpacked**
 
 6. Select the **`dist`** folder inside this project:
-   ```
-   E:\typescript\dist
-   ```
+   `dist/`
 
 Done. The extension is active.
 
@@ -36,11 +34,13 @@ Done. The extension is active.
 
 ## What it does
 
-- **Ignores** Google Images, Bing, YouTube, social media, and other normal image sites
-- **Zoho Desk tickets** — scans ticket messages on portals like `support.stayzltd.com` (path `/agent/.../tickets/details/`)
-- **Catches `share.google/...` links** on ticket images (zip download phishing — no `.zip` in the URL)
-- **Strict matching** on normal websites — executables only, not random URL substrings
-- Shows a **red banner** on ticket phishing images with the suspicious link shown
+- **Zoho Desk tickets only** — scans ticket messages on portals like `support.stayzltd.com` (path `/agent/.../tickets/details/`)
+- **Unified risk scoring (v2.4)** — combines multiple signals (trap URL, large clickable image, link-text mismatch, sender/subject context) into one confidence score
+- **Catches `share.google/...` links** on ticket images and **button-style links** (e.g. phishing “Send reply” buttons)
+- **Large image traps** — flags big clickable images that link to untrusted external hosts (not only Imgur/CDN lures)
+- **Link text mismatch** — warns when visible text says one site (e.g. `booking.com`) but the href goes elsewhere
+- **Ticket context** — boosts risk for free-webmail senders, urgent subjects, and brand-impersonation language
+- Shows a **red banner** on suspicious links/buttons with the destination URL shown
 - Blocks click unless you confirm
 
 ---
@@ -57,15 +57,24 @@ Then go to `chrome://extensions` and click the **refresh** icon on the extension
 
 ## Test it
 
-Create a simple HTML file on your desktop:
+Open a **Zoho Desk ticket details** page containing a clickable image that links to:
 
-```html
-<a href="https://example.com/malware.exe">
-  <img src="https://via.placeholder.com/200" alt="click me">
-</a>
-```
+- a known trap host like `share.google/...`, or
+- a URL that ends with an archive/executable extension like `.zip`, `.exe`, `.7z`, etc.
 
-Open that file in the browser — you should see the warning banner.
+On detection you should see:
+
+- a red banner at the top of the ticket,
+- the suspicious image highlighted,
+- and a `confirm()` warning when you click the image.
+
+---
+
+## Permissions
+
+- Runs only on Zoho Desk **ticket detail** URLs (`/tickets/details/`).
+- Uses `storage` (session only) to remember dismissed banners for the current browser session.
+- See [PRIVACY.md](PRIVACY.md) for details.
 
 ---
 

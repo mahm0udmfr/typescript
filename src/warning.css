@@ -1,12 +1,13 @@
 #dtg-warning-banner {
-  position: fixed;
+  position: sticky;
   top: 0;
-  left: 0;
-  right: 0;
-  z-index: 2147483647;
+  z-index: 99999;
   font-family: system-ui, -apple-system, Segoe UI, sans-serif;
   font-size: 14px;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  margin-bottom: 10px;
+  border-radius: 6px;
+  overflow: hidden;
 }
 
 .dtg-inner {
@@ -40,8 +41,40 @@
 .dtg-list {
   margin: 0;
   padding-left: 18px;
-  opacity: 0.9;
+  opacity: 0.95;
   font-size: 13px;
+}
+
+.dtg-list li {
+  margin-bottom: 6px;
+  line-height: 1.5;
+}
+
+.dtg-reason {
+  display: block;
+}
+
+.dtg-fake-url,
+.dtg-dest {
+  display: block;
+  font-size: 12px;
+  opacity: 0.85;
+  margin-top: 2px;
+}
+
+#dtg-warning-banner .dtg-list code {
+  background: rgba(0, 0, 0, 0.30);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11.5px;
+  word-break: break-all;
+  user-select: text;
+}
+
+.dtg-url-code {
+  background: rgba(0, 0, 0, 0.40) !important;
+  color: #fecaca !important;
+  font-weight: 500;
 }
 
 .dtg-dismiss {
@@ -70,10 +103,14 @@ a.dtg-highlight-link img {
 
 a.dtg-highlight-link {
   position: relative;
+  outline: 3px solid #ef4444 !important;
+  outline-offset: 3px;
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.6) !important;
+  background: rgba(239, 68, 68, 0.15) !important;
 }
 
 a.dtg-highlight-link::after {
-  content: "⚠ DOWNLOAD";
+  content: "⚠ TRAP";
   position: absolute;
   bottom: 4px;
   left: 4px;
@@ -84,4 +121,31 @@ a.dtg-highlight-link::after {
   padding: 2px 6px;
   border-radius: 4px;
   pointer-events: none;
+  z-index: 1;
+}
+
+button.dtg-highlight-button,
+input.dtg-highlight-button,
+.dtg-highlight-button {
+  position: relative;
+  outline: 3px solid #ef4444 !important;
+  outline-offset: 3px;
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.6) !important;
+}
+
+button.dtg-highlight-button::after,
+input.dtg-highlight-button::after,
+.dtg-highlight-button::after {
+  content: "⚠ TRAP";
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 2147483646;
 }

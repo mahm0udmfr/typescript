@@ -1,24 +1,54 @@
 {
   "manifest_version": 3,
   "name": "Download Trap Guard",
-  "version": "2.0.0",
-  "description": "Warns when a Zoho Desk ticket has a clickable image that triggers a file download.",
-  "permissions": [],
-  "host_permissions": ["<all_urls>"],
+  "version": "2.6.2",
+  "description": "Warns when a Zoho Desk ticket has a suspicious image, link, or button that triggers a file download.",
+  "permissions": ["storage", "scripting"],
+  "host_permissions": [
+    "*://*.stayzltd.com/*",
+    "*://*.zoho.com/*",
+    "*://*.zoho.eu/*",
+    "*://*.zohodesk.com/*",
+    "*://*.zohopublic.com/*",
+    "*://*.zappsusercontent.com/*",
+    "*://*.zohostratus.com/*",
+    "*://*.zohocloud.ca/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "matches": [
+        "*://*.stayzltd.com/*",
+        "*://*.zoho.com/*",
+        "*://*.zoho.eu/*",
+        "*://*.zohodesk.com/*",
+        "*://*.zohopublic.com/*",
+        "*://*.zappsusercontent.com/*",
+        "*://*.zohostratus.com/*",
+        "*://*.zohocloud.ca/*"
+      ],
+      "js": ["analysis.js", "content.js"],
       "css": ["warning.css"],
-      "run_at": "document_end",
-      "all_frames": true
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true
     }
   ],
   "action": {
     "default_title": "Download Trap Guard",
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
   }
 }
