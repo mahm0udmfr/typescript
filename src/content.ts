@@ -474,14 +474,17 @@ function applyHighlights(risks: RiskyTarget[]): void {
     el.querySelectorAll("img").forEach((img) => img.classList.add("dtg-highlight"));
     flaggedElements.add(el);
 
-    // Inject a red warning badge next to the flagged element (only once).
-    if (!el.nextSibling || !(el.nextSibling instanceof HTMLElement &&
-        el.nextSibling.classList.contains("cbs-threat-badge"))) {
+    // Add tooltip attribute — CSS ::after rule reads this on hover.
+    el.setAttribute("data-cbs-tooltip", "⚠  CBS Hunter: Phishing trap — do not click");
+
+    // Inject a red pulsing TRAP badge immediately after the flagged element (only once).
+    const alreadyBadged = el.nextElementSibling?.classList.contains("cbs-threat-badge");
+    if (!alreadyBadged) {
       const badge = document.createElement("span");
       badge.className = "cbs-threat-badge";
       badge.setAttribute("data-cbs-badge", "1");
-      badge.title = "CBS Hunter: Phishing trap — do not click";
-      badge.innerHTML = "&#9888; TRAP";
+      // Shield icon + label — aligned via inline-flex in CSS
+      badge.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style="flex-shrink:0;vertical-align:middle"><path d="M12 2L3 7v5c0 5.25 3.75 10.15 9 11.35C17.25 22.15 21 17.25 21 12V7L12 2z"/></svg>TRAP`;
       el.insertAdjacentElement("afterend", badge);
     }
   });
@@ -495,6 +498,7 @@ function clearWarnings(opts?: { removeHighlights?: boolean }): void {
   for (const { element: el } of activeHighlights) {
     try {
       el.classList.remove("dtg-highlight-link", "dtg-highlight-button");
+      el.removeAttribute("data-cbs-tooltip");
       el.querySelectorAll("img").forEach((img) => img.classList.remove("dtg-highlight"));
       flaggedElements.delete(el);
     } catch { /* ignore */ }
