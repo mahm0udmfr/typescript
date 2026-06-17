@@ -544,6 +544,10 @@ function clearWarnings(opts?: { removeHighlights?: boolean }): void {
   document.getElementById(PANEL_ID)?.remove();
   document.querySelectorAll("[data-cbs-badge]").forEach((b) => b.remove());
   if (opts?.removeHighlights === false) return;
+  clearHighlights();
+}
+
+function clearHighlights(): void {
   for (const { element: el } of activeHighlights) {
     try {
       el.classList.remove("dtg-highlight-link", "dtg-highlight-button");
@@ -575,8 +579,7 @@ async function showPanel(risks: SerializedRisk[]): Promise<void> {
   if (key === lastBannerKey) return;
   if (await isPanelDismissed(key)) return;
   lastBannerKey = key;
-
-  document.getElementById(PANEL_ID)?.remove();
+  const existingPanel = document.getElementById(PANEL_ID);
 
   let logoUrl = "";
   try {
@@ -638,15 +641,27 @@ async function showPanel(risks: SerializedRisk[]): Promise<void> {
       <button type="button" class="cbs-btn cbs-btn-dismiss">✕&nbsp; Dismiss</button>
     </div>`;
 
-  panel.querySelector(".cbs-btn-dismiss")?.addEventListener("click", () => {
-    void rememberDismissed(key);
-    panel.classList.remove("cbs-visible");
-    setTimeout(() => panel.remove(), 350);
-  });
+  const bindDismiss = (target: HTMLElement): void => {
+    target.querySelector(".cbs-btn-dismiss")?.addEventListener("click", () => {
+      void rememberDismissed(key);
+      target.classList.remove("cbs-visible");
+      setTimeout(() => target.remove(), 350);
+    });
+  };
 
-  document.body.appendChild(panel);
-  // Trigger slide-in animation on next frame
-  requestAnimationFrame(() => requestAnimationFrame(() => panel.classList.add("cbs-visible")));
+  if (existingPanel) {
+    // Risk results can arrive twice: once from the main-frame scan and once from
+    // the email iframe postMessage. Keep the SAME root element visible and only
+    // update its content; replacing the root can look like a second animation.
+    existingPanel.innerHTML = panel.innerHTML;
+    existingPanel.classList.add("cbs-visible");
+    bindDismiss(existingPanel);
+  } else {
+    document.body.appendChild(panel);
+    bindDismiss(panel);
+    // Trigger slide-in animation only for the first render.
+    requestAnimationFrame(() => requestAnimationFrame(() => panel.classList.add("cbs-visible")));
+  }
 }
 
 // ── Main scan loop ─────────────────────────────────────────────────────────
@@ -663,10 +678,18 @@ function emailFingerprint(): string {
     '[class*="msgContent"]', '[class*="emailContent"]', '[class*="threadBody"]',
     '[class*="richtext"]', '[class*="threadDetail"]', '[class*="conversation"]'
   ];
+  const visibleTextWithoutHunterUi = (el: Element): string => {
+    const clone = el.cloneNode(true);
+    if (!(clone instanceof Element)) return "";
+    // Ignore our injected badges/panel; otherwise the second scan sees "TRAP"
+    // as new email text, clears the panel, and replays the warning animation.
+    clone.querySelectorAll("[data-cbs-badge], #cbs-hunter-panel").forEach((n) => n.remove());
+    return clone.textContent?.replace(/\s+/g, " ").trim().slice(0, 200) ?? "";
+  };
   for (const sel of EMAIL_SELECTORS) {
     const el = document.querySelector(sel);
     if (el && !el.closest(LIST_EXCLUDE)) {
-      const t = el.textContent?.replace(/\s+/g, " ").trim().slice(0, 200) ?? "";
+      const t = visibleTextWithoutHunterUi(el);
       if (t.length > 20) return t;
     }
   }
@@ -682,16 +705,27 @@ async function scanAndWarn(): Promise<void> {
     if (!shouldActivate()) return;
 
     // Detect when Zoho switches to a different conversation (same URL, different content).
+    // Do NOT clear the panel yet: Zoho can mutate the same email during load.
+    // We scan first, then clear only if the new content has no risks.
     const fp = emailFingerprint();
+    const contentChanged = Boolean(fp && fp !== lastEmailFingerprint);
     if (fp && fp !== lastEmailFingerprint) {
       lastEmailFingerprint = fp;
       ctxCache = null; ctxTs = 0;
-      clearWarnings();
-      lastBannerKey = "";
     }
 
     const risks = findRiskyTargets();
-    if (risks.length === 0) return;
+    if (risks.length === 0) {
+      if (contentChanged) {
+        clearWarnings();
+        lastBannerKey = "";
+      }
+      return;
+    }
+
+    // If the content changed but phishing is still present, refresh highlights
+    // without removing the already-visible panel (prevents double animation).
+    if (contentChanged) clearHighlights();
 
     // Always apply element highlights in the current frame.
     applyHighlights(risks);

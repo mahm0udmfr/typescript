@@ -33,18 +33,22 @@
   all: unset;
   display: flex !important;
   align-items: center !important;
-  gap: 10px !important;
-  padding: 12px 14px !important;
-  background: #0d0902 !important;
-  border-bottom: 1px solid rgba(200,160,48,0.35) !important;
+  gap: 12px !important;
+  padding: 13px 15px 12px !important;
+  background:
+    radial-gradient(circle at 28px 26px, rgba(232,200,74,0.16), transparent 46px),
+    linear-gradient(135deg, rgba(13,9,2,0.58), rgba(26,18,5,0.18)) !important;
+  border-bottom: 1px solid rgba(200,160,48,0.26) !important;
+  box-shadow: inset 0 -1px 0 rgba(255,255,255,0.035) !important;
   flex-shrink: 0 !important;
 }
 
 #cbs-hunter-panel .cbs-logo {
-  width: 46px !important;
-  height: 46px !important;
+  width: 58px !important;
+  height: 58px !important;
   object-fit: contain !important;
   flex-shrink: 0 !important;
+  filter: drop-shadow(0 0 8px rgba(232,200,74,0.32)) drop-shadow(0 2px 4px rgba(0,0,0,0.55)) !important;
 }
 
 #cbs-hunter-panel .cbs-brand {
@@ -56,20 +60,21 @@
 #cbs-hunter-panel .cbs-brand-top {
   font-size: 8.5px !important;
   letter-spacing: 2.5px !important;
-  color: #b8902a !important;
+  color: #d5b84a !important;
   text-transform: uppercase !important;
   font-weight: 600 !important;
   font-family: inherit !important;
 }
 
 #cbs-hunter-panel .cbs-brand-hunter {
-  font-size: 22px !important;
+  font-size: 23px !important;
   font-weight: 900 !important;
   color: #e8c84a !important;
   letter-spacing: 4px !important;
   text-transform: uppercase !important;
   font-family: inherit !important;
   line-height: 1.15 !important;
+  text-shadow: 0 0 10px rgba(232,200,74,0.22), 0 2px 2px rgba(0,0,0,0.55) !important;
 }
 
 /* ── Alert strip ────────────────────────────────────────────────────────── */
