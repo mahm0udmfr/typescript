@@ -460,22 +460,23 @@ function panelKey(risks: SerializedRisk[]): string {
   return risks.map((r) => `${r.kind}|${r.targetUrl}|${r.displayLabel}`).sort().join("||");
 }
 
-async function isPanelDismissed(key: string): Promise<boolean> {
+// Use browser-native sessionStorage instead of chrome.storage.session so that
+// context-invalidation errors can never leak out of these functions.
+function isPanelDismissed(key: string): boolean {
   try {
-    if (!isContextAlive()) return false;
-    const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
-    return Boolean((d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined)?.[key]);
-  } catch (e) { markContextDead(e); return false; }
+    const raw = sessionStorage.getItem(DISMISS_STORAGE_KEY);
+    if (!raw) return false;
+    return Boolean((JSON.parse(raw) as Record<string, number>)[key]);
+  } catch { return false; }
 }
 
-async function rememberDismissed(key: string): Promise<void> {
+function rememberDismissed(key: string): void {
   try {
-    if (!isContextAlive()) return;
-    const d = await chrome.storage.session.get(DISMISS_STORAGE_KEY);
-    const map = (d[DISMISS_STORAGE_KEY] as Record<string, number> | undefined) ?? {};
+    const raw = sessionStorage.getItem(DISMISS_STORAGE_KEY) ?? "{}";
+    const map = JSON.parse(raw) as Record<string, number>;
     map[key] = Date.now();
-    await chrome.storage.session.set({ [DISMISS_STORAGE_KEY]: map });
-  } catch (e) { markContextDead(e); }
+    sessionStorage.setItem(DISMISS_STORAGE_KEY, JSON.stringify(map));
+  } catch { /* ignore */ }
 }
 
 function applyHighlights(risks: RiskyTarget[]): void {
@@ -541,7 +542,7 @@ async function showPanel(risks: SerializedRisk[]): Promise<void> {
 async function _showPanel(risks: SerializedRisk[]): Promise<void> {
   const key = panelKey(risks);
   if (key === lastBannerKey) return;
-  if (await isPanelDismissed(key)) return;
+  if (isPanelDismissed(key)) return;
   lastBannerKey = key;
 
   document.getElementById(PANEL_ID)?.remove();
@@ -605,7 +606,7 @@ async function _showPanel(risks: SerializedRisk[]): Promise<void> {
     </div>`;
 
   panel.querySelector(".cbs-btn-dismiss")?.addEventListener("click", () => {
-    void rememberDismissed(key);
+    rememberDismissed(key);
     panel.classList.remove("cbs-visible");
     setTimeout(() => panel.remove(), 350);
   });
