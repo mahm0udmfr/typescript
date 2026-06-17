@@ -69,29 +69,49 @@ let lastEmailFingerprint = "";
 let activeHighlights: HighlightRef[] = [];
 const flaggedElements = new WeakSet<HTMLElement>();
 
-// Set to true the first time we catch "Extension context invalidated".
-// Once dead, ALL chrome API calls and scan loops are permanently skipped.
+// ── Context death management ────────────────────────────────────────────────
+// Once contextInvalidated is true, every callback, observer, and interval
+// must be stopped immediately so no further code runs on the dead context.
 let contextInvalidated = false;
+let _mutationObs: MutationObserver | null = null;
+let _iframeObs: MutationObserver | null = null;
+const _intervals: ReturnType<typeof setInterval>[] = [];
 
 function isContextAlive(): boolean {
   if (contextInvalidated) return false;
-  try { return !!chrome?.runtime?.id; } catch { contextInvalidated = true; return false; }
+  try { return !!chrome?.runtime?.id; } catch { markContextDead("context"); return false; }
 }
 
-/** Call when any chrome API throws "context invalidated" to silence all future work. */
+/**
+ * Called whenever any chrome API or DOM operation throws "context invalidated".
+ * Immediately stops ALL observers and intervals so nothing else can run.
+ */
 function markContextDead(e: unknown): void {
-  if (String(e).toLowerCase().includes("context")) contextInvalidated = true;
+  if (contextInvalidated) return;
+  if (!String(e).toLowerCase().includes("context")) return;
+  contextInvalidated = true;
+  // Tear down everything — this is the only way to guarantee no more callbacks fire.
+  try { _mutationObs?.disconnect(); } catch { /* ignore */ }
+  try { _iframeObs?.disconnect(); } catch { /* ignore */ }
+  _intervals.forEach(id => { try { clearInterval(id); } catch { /* ignore */ } });
+  _intervals.length = 0;
+  if (scanTimer) { try { clearTimeout(scanTimer); } catch { /* ignore */ } scanTimer = null; }
 }
 
-// Intercept ANY unhandled promise rejection that contains "Extension context invalidated"
-// at the window level. Chrome logs these before JS try/catch can silence them — this handler
-// is the last line of defence that prevents them from appearing in DevTools.
+// Intercept unhandled promise rejections AND synchronous errors caused by
+// "Extension context invalidated" before Chrome DevTools can log them.
 window.addEventListener("unhandledrejection", (ev) => {
   if (String(ev.reason).toLowerCase().includes("context")) {
     ev.preventDefault();
     markContextDead(ev.reason);
   }
 });
+window.addEventListener("error", (ev) => {
+  if (String(ev.message).toLowerCase().includes("context")) {
+    ev.preventDefault();
+    markContextDead(ev.message);
+  }
+}, true);
 
 type HighlightRef = { element: HTMLElement; targetUrl: string };
 
@@ -709,8 +729,9 @@ async function _scanAndWarn(): Promise<void> {
 }
 
 function scheduleScan(): void {
+  if (!isContextAlive()) return;
   if (scanTimer) clearTimeout(scanTimer);
-  scanTimer = setTimeout(() => void scanAndWarn(), 350);
+  scanTimer = setTimeout(() => { if (!isContextAlive()) return; void scanAndWarn(); }, 350);
 }
 
 function onRouteChange(): void {
@@ -738,13 +759,17 @@ function startWatching(): void {
 
   void scanAndWarn();
 
-  new MutationObserver(scheduleScan).observe(document.documentElement, {
+  // Store observer refs so markContextDead() can disconnect them instantly.
+  _mutationObs = new MutationObserver(scheduleScan);
+  _mutationObs.observe(document.documentElement, {
     childList: true, subtree: true, attributes: true,
     attributeFilter: ["href", "src", "onclick", "formaction", "data-href", "data-url"]
   });
 
-  setInterval(() => { if (!isContextAlive()) return; void scanAndWarn(); }, 5000);
-  setInterval(() => { if (!isContextAlive()) return; onRouteChange(); }, 1500);
+  _intervals.push(
+    setInterval(() => { if (!isContextAlive()) return; void scanAndWarn(); }, 5000),
+    setInterval(() => { if (!isContextAlive()) return; onRouteChange(); }, 1500)
+  );
 
   // Delayed scans — email content in Zoho often loads 1-5s after document_idle
   for (const ms of [300, 800, 1500, 2500, 4000, 7000, 12000, 20000]) {
@@ -759,12 +784,14 @@ function startWatching(): void {
     setTimeout(() => { if (!isContextAlive()) return; void scanAndWarn(); }, 800);
   };
   document.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
-  new MutationObserver((muts) => {
+  _iframeObs = new MutationObserver((muts) => {
+    if (!isContextAlive()) return;
     for (const m of muts) m.addedNodes.forEach((n) => {
       if (n instanceof HTMLIFrameElement) attachFrame(n);
       if (n instanceof Element) n.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
     });
-  }).observe(document.documentElement, { childList: true, subtree: true });
+  });
+  _iframeObs.observe(document.documentElement, { childList: true, subtree: true });
 }
 
 // Expose rescan hook so the IIFE guard can call it on re-injection
