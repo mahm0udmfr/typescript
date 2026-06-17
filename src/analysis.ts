@@ -68,11 +68,20 @@ export const IMAGE_LURE_HOSTS = [
 ];
 
 export const CTA_KEYWORDS = [
-  "send reply", "reply now", "click here", "download", "view invoice", "view document",
-  "open attachment", "confirm", "verify", "update payment", "sign in", "log in",
-  "reset password", "view details", "view feedback", "view complaint", "view report",
-  "view case", "view claim", "view dispute", "view summary", "see details",
-  "check details", "take action", "open report", "review", "accept", "respond"
+  // Reply / messaging
+  "send reply", "reply now", "click here", "respond", "reply",
+  // View / open documents
+  "download", "view invoice", "view document", "open attachment", "view details",
+  "view feedback", "view complaint", "view report", "view case", "view claim",
+  "view dispute", "view summary", "view message", "read message", "see details",
+  "check details", "open report", "review", "take action", "open report",
+  // Auth
+  "confirm", "verify", "update payment", "sign in", "log in", "reset password",
+  // Action verbs commonly used in phishing buttons
+  "process", "proceed", "continue", "accept", "approve", "authorize", "activate",
+  "validate", "cancel", "cancellation", "process cancellation", "manage booking",
+  "update details", "confirm booking", "make payment", "pay now", "pay",
+  "complete", "resolve", "submit", "respond now", "act now", "get started"
 ];
 
 export const URGENCY_SUBJECT_KEYWORDS = [
@@ -427,6 +436,52 @@ function collectTicketContextSignals(
   return signals;
 }
 
+/** Is this an external (untrusted) clickable call-to-action? */
+function isExternalActionable(host: string, pageHost: string, context: NavigationContext): boolean {
+  if (isTrustedHost(host, pageHost)) return false;
+  return (
+    context.kind === "button-element" ||
+    context.kind === "button-link" ||
+    context.buttonStyled === true ||
+    isSuspiciousCtaLabel(context.label ?? "")
+  );
+}
+
+/**
+ * Generalizing signal: the email impersonates a known brand, but its action
+ * button/link points to a domain that is neither the brand's official domain
+ * nor the support portal. This is the universal phishing signature — it catches
+ * NEW, never-before-seen malicious domains without any hardcoded list, because a
+ * genuine "Booking.com" email always links back to booking.com (a trusted host),
+ * while a fake one links somewhere else.
+ */
+function collectBrandCtaComboSignals(
+  host: string,
+  pageHost: string,
+  context: NavigationContext
+): RiskSignal[] {
+  const ticket = context.ticket;
+  if (!ticket || isTrustedHost(host, pageHost)) return [];
+  if (!isExternalActionable(host, pageHost, context)) return [];
+
+  const senderName = ticket.senderDisplayName?.trim() ?? "";
+  const subject = ticket.subject?.trim() ?? "";
+  const senderEmail = ticket.senderEmail?.trim() ?? "";
+  const impersonationText = `${senderName} ${subject}`.trim();
+  if (!impersonationText || !hasBrandImpersonationLanguage(impersonationText)) return [];
+
+  // Don't fire if the sender's own domain legitimately matches the brand
+  // (e.g. a real hotel whose domain contains its brand name).
+  const senderDomain = senderEmail ? (senderEmail.split("@").pop() ?? "") : "";
+  const senderMatchesBrand = BRAND_IMPERSONATION_KEYWORDS.some((b) => senderDomain.includes(b));
+  if (senderMatchesBrand) return [];
+
+  return [{
+    score: 45,
+    reason: `Email impersonates a known brand but its action button links to an unrelated site (${host})`
+  }];
+}
+
 export function analyzeNavigationTarget(
   url: string,
   pageHost: string,
@@ -478,6 +533,7 @@ export function analyzeNavigationTarget(
     signals.push(...collectImageSignals(host, pageHost, parsed, context, imgHost));
     signals.push(...collectButtonSignals(host, pageHost, context));
     signals.push(...collectTicketContextSignals(host, pageHost, context));
+    signals.push(...collectBrandCtaComboSignals(host, pageHost, context));
 
     return finalizeRiskScore(signals);
   } catch {

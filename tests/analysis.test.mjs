@@ -343,6 +343,64 @@ assert.equal(searchAppTrap.dangerous, true, "search.app redirect should be flagg
 assert.ok(searchAppTrap.confidence >= 95, `searchAppTrap confidence: ${searchAppTrap.confidence}`);
 assert.equal(checkDownloadTrapHost("search.app").dangerous, true, "search.app should be a known trap host");
 
+// ── Ticket #150428: generalizing brand-impersonation + external CTA ─────────────
+// Sender: phil@circleminc.com (display "Booking.com Message") impersonating Booking.com.
+// Button "Process cancellation" → https://jinsureongo.net (a NEW domain, NOT hardcoded).
+// Must be caught by the generalizing combo signal, not a trap-host list.
+
+const newUnknownDomainTrap = analyzeNavigationTarget(
+  "https://jinsureongo.net",
+  "support.stayzltd.com",
+  "https://support.stayzltd.com/agent/tickets/details/150428",
+  {
+    kind: "button-link",
+    label: "Process cancellation",
+    buttonStyled: true,
+    ticket: {
+      senderEmail: "phil@circleminc.com",
+      subject: "Booking.com - We have new guest message! #5204849431",
+      senderDisplayName: "Booking.com Message"
+    }
+  }
+);
+assert.equal(newUnknownDomainTrap.dangerous, true, "Brand impersonation + external CTA to a NEW domain should be flagged without hardcoding");
+assert.ok(newUnknownDomainTrap.confidence >= 70, `newUnknownDomainTrap confidence: ${newUnknownDomainTrap.confidence}`);
+
+// Generalization check: a button label NOT in the CTA list, brand impersonation + styled button.
+const unknownLabelTrap = analyzeNavigationTarget(
+  "https://totally-new-evil-domain-xyz.com",
+  "support.stayzltd.com",
+  "https://support.stayzltd.com/agent/tickets/details/999999",
+  {
+    kind: "button-link",
+    label: "Открыть детали",   // non-English / unknown label
+    buttonStyled: true,
+    ticket: {
+      senderEmail: "noreply@randomdomain123.ru",
+      subject: "Booking.com reservation update",
+      senderDisplayName: "Booking.com"
+    }
+  }
+);
+assert.equal(unknownLabelTrap.dangerous, true, "Brand impersonation + styled external button with unknown label should still flag");
+
+// False-positive guard: a real hotel whose own domain matches its brand, plain link.
+const legitHotelLink = analyzeNavigationTarget(
+  "https://grandhotel.com/booking/confirm",
+  "support.stayzltd.com",
+  "https://support.stayzltd.com/agent/tickets/details/5",
+  {
+    kind: "text-link",
+    label: "View your reservation",
+    ticket: {
+      senderEmail: "reservations@grandhotel.com",
+      subject: "Your hotel reservation",
+      senderDisplayName: "Grand Hotel"
+    }
+  }
+);
+assert.equal(legitHotelLink.dangerous, false, "Legit hotel whose domain matches its brand should not be flagged");
+
 // Real booking.com link from real booking.com address should NOT flag
 const realBookingLink = analyzeNavigationTarget(
   "https://booking.com/complaint?op_token=abc123",
