@@ -50,7 +50,9 @@ export const TRUSTED_LINK_HOSTS = [
   "zoho.com", "zohocdn.com", "zohostatic.com", "zohopublic.com",
   "zappsusercontent.com", "zohostratus.com", "zohocorpcloud.com",
   "imgur.com", "i.imgur.com", "eviivo.com",
-  "booking.com", "airbnb.com", "expedia.com"
+  "booking.com", "airbnb.com", "expedia.com",
+  // CBS partner links. Keep this specific: do not trust all *.go.link.
+  "perk.go.link"
 ];
 
 export const DOWNLOAD_TRAP_HOST_EXACT = new Set([

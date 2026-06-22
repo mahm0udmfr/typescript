@@ -401,6 +401,28 @@ const legitHotelLink = analyzeNavigationTarget(
 );
 assert.equal(legitHotelLink.dangerous, false, "Legit hotel whose domain matches its brand should not be flagged");
 
+// False-positive guard: Perk is a CBS partner and uses perk.go.link app/deep links.
+// The email can contain a large clickable QR/banner image, but this partner host
+// should not be treated like an unknown image trap.
+const legitPerkPartnerLink = analyzeNavigationTarget(
+  "https://perk.go.link/6XJB4",
+  "support.stayzltd.com",
+  "https://support.stayzltd.com/agent/tickets/details/237447",
+  {
+    kind: "image-link",
+    label: "Scan the code or click here to download the app",
+    imgSrc: "https://perk.com/assets/app-banner.png",
+    imgWidth: 403,
+    imgHeight: 167,
+    ticket: {
+      senderEmail: "support@perk.com",
+      subject: "[Perk] Re: Claim invoice for reservation 678140900",
+      senderDisplayName: "Perk"
+    }
+  }
+);
+assert.equal(legitPerkPartnerLink.dangerous, false, "Perk partner app link should not be flagged");
+
 // Real booking.com link from real booking.com address should NOT flag
 const realBookingLink = analyzeNavigationTarget(
   "https://booking.com/complaint?op_token=abc123",
