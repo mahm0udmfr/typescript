@@ -1,6 +1,6 @@
 {
   "name": "download-trap-guard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "Browser extension — warns when a Zoho Desk ticket has clickable images that trigger downloads",
@@ -11,6 +11,7 @@
   },
   "devDependencies": {
     "@types/chrome": "^0.0.287",
+    "sharp": "^0.35.2",
     "typescript": "^5.7.2"
   }
 }
