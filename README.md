@@ -74,7 +74,7 @@ On detection you should see:
 
 - Runs only on Zoho Desk **ticket detail** URLs (`/tickets/details/`).
 - Uses `storage` (session only) to remember dismissed banners for the current browser session.
-- See [PRIVACY.md](PRIVACY.md) for details.
+- See [PRIVACY.md](PRIVACY.md) for Chrome Web Store data usage and privacy disclosures.
 
 ---
 
