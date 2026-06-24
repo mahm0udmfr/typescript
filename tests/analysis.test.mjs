@@ -384,6 +384,26 @@ const unknownLabelTrap = analyzeNavigationTarget(
 );
 assert.equal(unknownLabelTrap.dangerous, true, "Brand impersonation + styled external button with unknown label should still flag");
 
+// ── Ticket #187993: Booking.com photo documentation phishing via Workers.dev ───
+// Sender display/name impersonates Booking.com, but email is from Gmail.
+// Plain text CTA "View photo documentation" goes to a random workers.dev host.
+const bookingPhotoDocumentationTrap = analyzeNavigationTarget(
+  "https://dvbvbz-s0e1c.nevaehvida17991.workers.dev",
+  "support.stayzltd.com",
+  "https://support.stayzltd.com/agent/tickets/details/187993",
+  {
+    kind: "text-link",
+    label: "View photo documentation",
+    ticket: {
+      senderEmail: "mohicucgsv40@gmail.com",
+      subject: "Hochzeit organisieren bei ihnen",
+      senderDisplayName: "Booking.com"
+    }
+  }
+);
+assert.equal(bookingPhotoDocumentationTrap.dangerous, true, "Booking.com photo documentation CTA to workers.dev should be flagged");
+assert.ok(bookingPhotoDocumentationTrap.confidence >= 70, `bookingPhotoDocumentationTrap confidence: ${bookingPhotoDocumentationTrap.confidence}`);
+
 // False-positive guard: a real hotel whose own domain matches its brand, plain link.
 const legitHotelLink = analyzeNavigationTarget(
   "https://grandhotel.com/booking/confirm",

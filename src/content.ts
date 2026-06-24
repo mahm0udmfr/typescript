@@ -174,6 +174,18 @@ function extractEmail(t: string): string | undefined {
   return t.match(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/i)?.[0]?.toLowerCase();
 }
 
+function extractDisplayName(t: string): string | undefined {
+  const email = extractEmail(t);
+  if (!email) return undefined;
+  const beforeEmail = t.split(email)[0] ?? "";
+  const cleaned = beforeEmail
+    .replace(/\bfrom\b/i, "")
+    .replace(/[<>"“”]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned.length > 1 && cleaned.length < 80 ? cleaned : undefined;
+}
+
 function getTicketContext(): TicketContext {
   const now = Date.now();
   if (ctxCache && now - ctxTs < 4000) return ctxCache;
@@ -192,13 +204,30 @@ function getTicketContext(): TicketContext {
 
   const mailSel = '[class*="requesterMail"],[class*="fromMail"],[class*="senderEmail"],[class*="fromEmail"]';
   for (const el of Array.from(document.querySelectorAll(mailSel))) {
-    const e = extractEmail(el.textContent ?? "");
-    if (e) { ctx.senderEmail = e; break; }
+    const text = el.textContent ?? "";
+    const e = extractEmail(text);
+    if (e) {
+      ctx.senderEmail = e;
+      ctx.senderDisplayName = extractDisplayName(text);
+      break;
+    }
   }
   if (!ctx.senderEmail) {
     for (const el of Array.from(document.querySelectorAll('a[href^="mailto:"]'))) {
       const e = extractEmail(el.getAttribute("href")?.replace(/^mailto:/i, "").split("?")[0] ?? "");
       if (e) { ctx.senderEmail = e; break; }
+    }
+  }
+
+  // Zoho often renders the From line as plain text, e.g.
+  // From "Booking.com"<attacker@gmail.com>. Capture the visible display name
+  // so brand-impersonation rules work even when there is no mailto: element.
+  if (!ctx.senderDisplayName && ctx.senderEmail) {
+    const bodyText = document.body?.textContent ?? "";
+    const idx = bodyText.toLowerCase().indexOf(ctx.senderEmail);
+    if (idx >= 0) {
+      const windowText = bodyText.slice(Math.max(0, idx - 90), idx + ctx.senderEmail.length);
+      ctx.senderDisplayName = extractDisplayName(windowText);
     }
   }
 

@@ -75,8 +75,10 @@ export const CTA_KEYWORDS = [
   // View / open documents
   "download", "view invoice", "view document", "open attachment", "view details",
   "view feedback", "view complaint", "view report", "view case", "view claim",
-  "view dispute", "view summary", "view message", "read message", "see details",
-  "check details", "open report", "review", "take action", "open report",
+  "view dispute", "view summary", "view message", "view photo", "view photos",
+  "view documentation", "photo documentation", "supporting evidence",
+  "supporting document", "read message", "see details", "check details",
+  "open report", "review", "take action", "open report",
   // Auth
   "confirm", "verify", "update payment", "sign in", "log in", "reset password",
   // Action verbs commonly used in phishing buttons
@@ -382,6 +384,16 @@ function collectButtonSignals(host: string, pageHost: string, context: Navigatio
   return signals;
 }
 
+function collectTextCtaSignals(host: string, pageHost: string, context: NavigationContext): RiskSignal[] {
+  if (context.kind !== "text-link" || isTrustedHost(host, pageHost)) return [];
+  const label = context.label ?? "";
+  if (!isSuspiciousCtaLabel(label)) return [];
+  return [{
+    score: 58,
+    reason: `Suspicious "${label.trim()}" link points to unrelated host ${host}`
+  }];
+}
+
 function collectTicketContextSignals(
   host: string,
   pageHost: string,
@@ -534,6 +546,7 @@ export function analyzeNavigationTarget(
     }
     signals.push(...collectImageSignals(host, pageHost, parsed, context, imgHost));
     signals.push(...collectButtonSignals(host, pageHost, context));
+    signals.push(...collectTextCtaSignals(host, pageHost, context));
     signals.push(...collectTicketContextSignals(host, pageHost, context));
     signals.push(...collectBrandCtaComboSignals(host, pageHost, context));
 
