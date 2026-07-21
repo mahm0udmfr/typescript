@@ -6,13 +6,13 @@
   "permissions": ["storage", "scripting"],
   "host_permissions": [
     "*://*.stayzltd.com/*",
-    "*://*.zoho.com/*",
-    "*://*.zoho.eu/*",
+    "*://desk.zoho.com/*",
+    "*://desk.zoho.eu/*",
+    "*://desk.zohocloud.ca/*",
     "*://*.zohodesk.com/*",
     "*://*.zohopublic.com/*",
     "*://*.zappsusercontent.com/*",
-    "*://*.zohostratus.com/*",
-    "*://*.zohocloud.ca/*"
+    "*://*.zohostratus.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -21,13 +21,13 @@
     {
       "matches": [
         "*://*.stayzltd.com/*",
-        "*://*.zoho.com/*",
-        "*://*.zoho.eu/*",
+        "*://desk.zoho.com/*",
+        "*://desk.zoho.eu/*",
+        "*://desk.zohocloud.ca/*",
         "*://*.zohodesk.com/*",
         "*://*.zohopublic.com/*",
         "*://*.zappsusercontent.com/*",
-        "*://*.zohostratus.com/*",
-        "*://*.zohocloud.ca/*"
+        "*://*.zohostratus.com/*"
       ],
       "js": ["analysis.js", "content.js"],
       "css": ["warning.css"],
@@ -49,7 +49,7 @@
   "web_accessible_resources": [
     {
       "resources": ["cbs-hunter-logo.png"],
-      "matches": ["*://*.stayzltd.com/*", "*://*.zoho.com/*", "*://*.zoho.eu/*", "*://*.zohodesk.com/*", "*://*.zohopublic.com/*"]
+      "matches": ["*://*.stayzltd.com/*", "*://desk.zoho.com/*", "*://desk.zoho.eu/*", "*://desk.zohocloud.ca/*", "*://*.zohodesk.com/*", "*://*.zohopublic.com/*"]
     }
   ],
   "icons": {

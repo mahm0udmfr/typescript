@@ -41,6 +41,15 @@ const LIST_EXCLUDE =
   '[class*="lhsPanel"], [class*="ticketList"], [class*="listView"], ' +
   '[class*="navPanel"], [class*="leftPanel"]';
 
+// Containers that hold the actual email body inside the Desk console. We scan
+// only these in the top frame so the console chrome (nav, toolbars, widgets,
+// composer buttons) is never analysed. Kept in sync with emailFingerprint().
+const EMAIL_CONTENT_SELECTORS = [
+  '[class*="mailContent"]', '[class*="mailWrapper"]', '[class*="thrdPlain"]',
+  '[class*="msgContent"]', '[class*="emailContent"]', '[class*="threadBody"]',
+  '[class*="richtext"]', '[class*="threadDetail"]', '[class*="conversation"]'
+];
+
 interface RiskyTarget {
   element: HTMLElement;
   targetUrl: string;
@@ -134,22 +143,74 @@ function isOnTicketPage(): boolean {
 }
 
 function isZohoDeskFrame(): boolean {
+  // Hosts that serve Desk email bodies / attachments inside an iframe.
+  // Intentionally NOT a loose "zoho.eu" substring — that matched every EU Zoho
+  // product (Mail, Cliq, Workplace) and caused scanning far outside Desk.
   const h = window.location.hostname.toLowerCase();
   return (
-    h.includes("zohopublic") ||
-    h.includes("zappsusercontent") ||
-    h.includes("zohostratus") ||
-    h.includes("zohocdn") ||
-    h.includes("zoho.eu")
+    h.endsWith("zohopublic.com") ||
+    h.endsWith("zappsusercontent.com") ||
+    h.endsWith("zohostratus.com") ||
+    h.endsWith("zohocdn.com")
   );
 }
 
+/** Is this origin/URL a Zoho Desk agent console (where tickets are read)? */
+function isDeskOrigin(originOrUrl: string): boolean {
+  try {
+    const h = new URL(originOrUrl).hostname.toLowerCase();
+    return (
+      h === "desk.zoho.com" ||
+      h === "desk.zoho.eu" ||
+      h === "desk.zohocloud.ca" ||
+      h.endsWith(".zohodesk.com") ||
+      h === "stayzltd.com" ||
+      h.endsWith(".stayzltd.com")
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Determine whether a sub-frame is embedded inside the Desk agent console.
+ * `ancestorOrigins` is authoritative when present: if it lists ancestors and
+ * none are Desk, we can definitively say "no" and stay silent (the key fix for
+ * false positives inside Zoho Mail / Workplace, which also render email iframes).
+ */
+function deskAncestorState(): "yes" | "no" | "unknown" {
+  try {
+    const ao = window.location.ancestorOrigins;
+    if (ao && ao.length > 0) {
+      for (let i = 0; i < ao.length; i++) {
+        if (isDeskOrigin(ao[i])) return "yes";
+      }
+      return "no";
+    }
+  } catch {
+    /* ancestorOrigins unsupported */
+  }
+  if (document.referrer) return isDeskOrigin(document.referrer) ? "yes" : "no";
+  return "unknown";
+}
+
 function shouldActivate(): boolean {
-  if (isOnTicketPage() || isZohoDeskFrame()) return true;
-  // Activate in any subframe — Zoho renders email bodies in iframes (about:blank,
-  // about:srcdoc, or cross-origin Zoho URLs) whose href doesn't match ticket patterns.
-  // The analysis confidence threshold + sidebar exclusion prevent false positives.
-  if (window !== window.top) return true;
+  // Top frame sitting on a ticket-details URL.
+  if (isOnTicketPage()) return true;
+
+  // Zoho renders email bodies in sub-frames (about:blank, about:srcdoc, or a
+  // cross-origin Zoho content host). Only activate when we can tie the frame
+  // back to the Desk console — otherwise identical iframes in Zoho Mail /
+  // Workplace get scanned and produce false positives.
+  if (window !== window.top) {
+    const state = deskAncestorState();
+    if (state === "yes") return true;
+    if (state === "no") return false;
+    // No ancestor info at all (e.g. srcdoc with empty referrer): fall back to
+    // recognised Desk content hosts only.
+    return isZohoDeskFrame();
+  }
+
   return false;
 }
 
@@ -481,6 +542,29 @@ function scanRoot(root: Element, host: string, seen: Set<string>, risks: RiskyTa
   });
 }
 
+/**
+ * Roots to scan for the current frame.
+ * - Sub-frame (the email iframe itself): the whole document *is* the email body.
+ * - Top Desk frame: only the email-content container(s), so the agent console's
+ *   own UI is never analysed. Falls back to <body> while content is still
+ *   loading (Desk's own links are same-origin and therefore trusted anyway).
+ */
+function getScanRoots(): Element[] {
+  if (window !== window.top) return document.body ? [document.body] : [];
+
+  const roots: Element[] = [];
+  for (const sel of EMAIL_CONTENT_SELECTORS) {
+    document.querySelectorAll(sel).forEach((el) => {
+      if (el.closest(LIST_EXCLUDE)) return;
+      if (roots.some((r) => r.contains(el))) return; // skip nested duplicates
+      roots.push(el);
+    });
+  }
+
+  if (roots.length === 0 && document.body) return [document.body];
+  return roots;
+}
+
 function findRiskyTargets(): RiskyTarget[] {
   if (!shouldActivate()) return [];
   if (!DTG()) return [];
@@ -489,7 +573,9 @@ function findRiskyTargets(): RiskyTarget[] {
   const risks: RiskyTarget[] = [];
   const host = pageHost();
 
-  scanRoot(document.body, host, seen, risks);
+  for (const root of getScanRoots()) {
+    scanRoot(root, host, seen, risks);
+  }
 
   return risks.sort((a, b) => b.confidence - a.confidence);
 }
@@ -702,11 +788,7 @@ async function showPanel(risks: SerializedRisk[]): Promise<void> {
  */
 function emailFingerprint(): string {
   // Prefer the dedicated email content container; fall back to the ticket-detail RHS panel.
-  const EMAIL_SELECTORS = [
-    '[class*="mailContent"]', '[class*="mailWrapper"]', '[class*="thrdPlain"]',
-    '[class*="msgContent"]', '[class*="emailContent"]', '[class*="threadBody"]',
-    '[class*="richtext"]', '[class*="threadDetail"]', '[class*="conversation"]'
-  ];
+  const EMAIL_SELECTORS = EMAIL_CONTENT_SELECTORS;
   const visibleTextWithoutHunterUi = (el: Element): string => {
     const clone = el.cloneNode(true);
     if (!(clone instanceof Element)) return "";
