@@ -153,6 +153,36 @@ export function hostsAreRelated(a: string, b: string): boolean {
   return left.endsWith("." + right) || right.endsWith("." + left);
 }
 
+/**
+ * Heuristic: does the registrable domain look like a random throwaway host,
+ * e.g. "haksdkweqw219dms.com" or "publick-gstx.com" — the kind of one-off
+ * domain used for a single phishing wave? High precision by design: real
+ * services a guest might legitimately link (drive.google.com, dropbox.com,
+ * wetransfer.com, sharepoint.com) do NOT trip it, so it can safely raise the
+ * risk score without reintroducing false positives on ordinary links.
+ */
+export function looksRandomDomain(hostname: string): boolean {
+  const host = normalizeHostname(hostname);
+  const parts = host.split(".");
+  if (parts.length < 2) return false;
+
+  // Second-level label (the registrable name), minus hyphens.
+  const label = (parts[parts.length - 2] ?? "").replace(/-/g, "");
+  if (label.length < 8) return false;
+
+  const letters = label.replace(/[^a-z]/g, "");
+  const digitCount = (label.match(/\d/g) ?? []).length;
+  if (letters.length === 0) return true; // all-digit label (e.g. a raw-IP-ish host)
+
+  const vowels = (letters.match(/[aeiou]/g) ?? []).length;
+  const vowelRatio = vowels / letters.length;
+  const hasLongConsonantRun = /[bcdfghjklmnpqrstvwxyz]{5,}/.test(letters);
+
+  // Random-looking: too few vowels to be words, a long unpronounceable
+  // consonant run, or a heavy letters+digits mix.
+  return vowelRatio < 0.26 || hasLongConsonantRun || (digitCount >= 3 && letters.length >= 5);
+}
+
 export function isShareGoogleVariant(hostname: string): boolean {
   const host = normalizeHostname(hostname);
   if (host === "share.google" || host.endsWith(".share.google")) return true;
@@ -476,7 +506,6 @@ function collectBrandCtaComboSignals(
 ): RiskSignal[] {
   const ticket = context.ticket;
   if (!ticket || isTrustedHost(host, pageHost)) return [];
-  if (!isExternalActionable(host, pageHost, context)) return [];
 
   const senderName = ticket.senderDisplayName?.trim() ?? "";
   const subject = ticket.subject?.trim() ?? "";
@@ -490,10 +519,29 @@ function collectBrandCtaComboSignals(
   const senderMatchesBrand = BRAND_IMPERSONATION_KEYWORDS.some((b) => senderDomain.includes(b));
   if (senderMatchesBrand) return [];
 
-  return [{
-    score: 45,
-    reason: `Email impersonates a known brand but its action button links to an unrelated site (${host})`
-  }];
+  // Tier 1 — an actionable element (button, or a link styled/labelled as a
+  // call to action) pointing at an unrelated site. Strongest signal.
+  if (isExternalActionable(host, pageHost, context)) {
+    return [{
+      score: 45,
+      reason: `Email impersonates a known brand but its action button links to an unrelated site (${host})`
+    }];
+  }
+
+  // Tier 2 — even a PLAIN link (no button styling, no CTA wording) counts when
+  // the sender is a free-webmail account impersonating a brand AND the target
+  // is a random-looking throwaway domain. This catches image/screenshot lures
+  // where the scam text lives inside a picture and the only clickable element
+  // is a bare "https://<random>.com/v" link — which otherwise scores too low.
+  const fromFreeWebmail = senderEmail ? isFreeWebmailHost(senderEmail) : false;
+  if (fromFreeWebmail && looksRandomDomain(host)) {
+    return [{
+      score: 36,
+      reason: `Brand-impersonation email from a free webmail account links to a suspicious domain (${host})`
+    }];
+  }
+
+  return [];
 }
 
 export function analyzeNavigationTarget(
@@ -587,6 +635,7 @@ if (typeof globalThis !== "undefined") {
       checkDownloadTrapHost: typeof checkDownloadTrapHost;
       extractDomainFromText: typeof extractDomainFromText;
       finalizeRiskScore: typeof finalizeRiskScore;
+      looksRandomDomain: typeof looksRandomDomain;
     };
   }).DTGAnalysis = {
     analyzeNavigationTarget,
@@ -599,6 +648,7 @@ if (typeof globalThis !== "undefined") {
     isShareGoogleVariant,
     checkDownloadTrapHost,
     extractDomainFromText,
-    finalizeRiskScore
+    finalizeRiskScore,
+    looksRandomDomain
   };
 }
