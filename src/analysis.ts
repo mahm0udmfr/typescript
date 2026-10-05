@@ -65,6 +65,15 @@ export const DOWNLOAD_TRAP_HOST_CONTAINS = [
   "share-google", "sharegoogle", "drive-google"
 ];
 
+// Distinctive trap markers that attackers hide in the PATH or QUERY of an
+// innocent-looking domain to dodge the host-only check and look legitimate to
+// the agent, e.g. https://www.google.com/share.google?q=… — which reads as
+// "google.com" but is really a share.google lure. These strings don't occur in
+// ordinary customer links, so matching them anywhere in the URL is low-FP.
+export const TRAP_URL_PATH_TOKENS = [
+  "share.google", "sharegoogle", "share-google", "drive-google"
+];
+
 export const IMAGE_LURE_HOSTS = [
   "imgur.com", "i.imgur.com", "ibb.co", "i.ibb.co", "postimg.cc", "postimages.org"
 ];
@@ -300,6 +309,35 @@ export function checkDownloadTrapHost(hostname: string): AnalysisResult {
         dangerous: true,
         reason: `Links to "${host}" — may download a file when clicked`,
         confidence: 92
+      };
+    }
+  }
+
+  return { dangerous: false, reason: "", confidence: 0 };
+}
+
+/**
+ * Catch a known trap address that's been hidden inside the PATH or QUERY of an
+ * innocuous-looking domain, e.g. https://www.google.com/share.google?q=… —
+ * an obfuscation of the share.google download trap that reads as "google.com"
+ * and slips past the host-only check above.
+ */
+export function checkTrapTokensInUrl(parsed: URL): AnalysisResult {
+  // De-obfuscate percent-encoding (e.g. %2e → ".", %2d → "-") before matching.
+  let hay = "";
+  try {
+    hay = decodeURIComponent(parsed.pathname + parsed.search).toLowerCase();
+  } catch {
+    hay = (parsed.pathname + parsed.search).toLowerCase();
+  }
+  hay = hay.replace(/%2e/g, ".").replace(/%2d/g, "-");
+
+  for (const token of TRAP_URL_PATH_TOKENS) {
+    if (hay.includes(token)) {
+      return {
+        dangerous: true,
+        reason: `Link hides a known trap address ("${token}") inside the URL`,
+        confidence: 95
       };
     }
   }
@@ -569,6 +607,15 @@ export function analyzeNavigationTarget(
       return trapHost;
     }
 
+    // Trap address hidden in the path/query of an innocent-looking host.
+    const trapInUrl = checkTrapTokensInUrl(parsed);
+    if (trapInUrl.dangerous) {
+      if (context.kind === "button-link" || context.kind === "button-element") {
+        return { ...trapInUrl, reason: trapInUrl.reason.replace("Link hides", "Button hides") };
+      }
+      return trapInUrl;
+    }
+
     const ext = extensionFromUrlParts(parsed.pathname, parsed.search, parsed.hash);
     if (ext && isDownloadExtension(ext)) {
       const label = context.kind === "button-link" || context.kind === "button-element" ? "Button" : "Link";
@@ -633,6 +680,7 @@ if (typeof globalThis !== "undefined") {
       extensionFromUrlParts: typeof extensionFromUrlParts;
       isShareGoogleVariant: typeof isShareGoogleVariant;
       checkDownloadTrapHost: typeof checkDownloadTrapHost;
+      checkTrapTokensInUrl: typeof checkTrapTokensInUrl;
       extractDomainFromText: typeof extractDomainFromText;
       finalizeRiskScore: typeof finalizeRiskScore;
       looksRandomDomain: typeof looksRandomDomain;
@@ -647,6 +695,7 @@ if (typeof globalThis !== "undefined") {
     extensionFromUrlParts,
     isShareGoogleVariant,
     checkDownloadTrapHost,
+    checkTrapTokensInUrl,
     extractDomainFromText,
     finalizeRiskScore,
     looksRandomDomain

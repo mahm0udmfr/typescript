@@ -12,7 +12,8 @@ import {
   checkHrefTextMismatch,
   finalizeRiskScore,
   isFreeWebmailHost,
-  looksRandomDomain
+  looksRandomDomain,
+  checkTrapTokensInUrl
 } from "../dist/analysis.esm.js";
 
 assert.equal(extensionFromPath("/files/archive.tar.gz"), ".tar.gz");
@@ -503,5 +504,42 @@ const legitGuestDropboxLink = analyzeNavigationTarget(
   }
 );
 assert.equal(legitGuestDropboxLink.dangerous, false, "plain dropbox link should not flag on context alone");
+
+// ── Trap address hidden in the URL path (share.google obfuscation) ───────────
+assert.equal(
+  checkTrapTokensInUrl(new URL("https://www.google.com/share.google?q=7s92n8Dj0DiQ7xKuU")).dangerous,
+  true,
+  "share.google in the path must be caught"
+);
+assert.equal(
+  checkTrapTokensInUrl(new URL("https://www.google.com/maps/place/Royal+Hotel")).dangerous,
+  false,
+  "ordinary google.com link must not be caught"
+);
+assert.equal(
+  checkTrapTokensInUrl(new URL("https://www.google.com/search?q=hotels")).dangerous,
+  false,
+  "ordinary google search link must not be caught"
+);
+
+// Ticket #338526: bare link reads as google.com but hides share.google in the
+// path. Sender is NOT free webmail, link text is the raw URL, so the heuristic
+// signals score too low — this must be caught by the trap-token-in-URL rule.
+const googleDotComShareGoogleLure = analyzeNavigationTarget(
+  "https://www.google.com/share.google?q=7s92n8Dj0DiQ7xKuU",
+  "support.stayzltd.com",
+  "https://support.stayzltd.com/agent/stayz/customer-support/tickets/details/338526",
+  {
+    kind: "text-link",
+    label: "https://www.google.com/share.google?q=7s92n8Dj0DiQ7xKuU",
+    ticket: {
+      senderEmail: "cs2@jmcht.com",
+      senderDisplayName: "Emily Johnson",
+      subject: "Online reservation could not be completed"
+    }
+  }
+);
+assert.equal(googleDotComShareGoogleLure.dangerous, true, "google.com/share.google lure must flag");
+assert.ok(googleDotComShareGoogleLure.confidence >= 90);
 
 console.log("analysis.test.mjs: all passed");
