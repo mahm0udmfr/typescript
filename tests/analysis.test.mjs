@@ -11,7 +11,9 @@ import {
   extractDomainFromText,
   checkHrefTextMismatch,
   finalizeRiskScore,
-  isFreeWebmailHost
+  isFreeWebmailHost,
+  looksRandomDomain,
+  checkTrapTokensInUrl
 } from "../dist/analysis.esm.js";
 
 assert.equal(extensionFromPath("/files/archive.tar.gz"), ".tar.gz");
@@ -454,5 +456,90 @@ const realBookingLink = analyzeNavigationTarget(
   }
 );
 assert.equal(realBookingLink.dangerous, false, "Genuine booking.com link should not flag");
+
+// ── Random throwaway domain heuristic ───────────────────────────────────────
+assert.equal(looksRandomDomain("haksdkweqw219dms.com"), true, "gibberish domain is random");
+assert.equal(looksRandomDomain("publick-gstx.com"), true, "known lure domain is random");
+// Legitimate hosts a real guest might link must NOT read as random:
+assert.equal(looksRandomDomain("drive.google.com"), false, "google is not random");
+assert.equal(looksRandomDomain("dropbox.com"), false, "dropbox is not random");
+assert.equal(looksRandomDomain("wetransfer.com"), false, "wetransfer is not random");
+assert.equal(looksRandomDomain("sharepoint.com"), false, "sharepoint is not random");
+assert.equal(looksRandomDomain("booking.com"), false, "booking is not random");
+
+// Ticket #299284: bare link to a random domain, free-webmail sender
+// impersonating a hotel brand, scam text hidden in a screenshot image.
+// Previously scored 48 (< 70) and was missed; must now flag.
+const bareLinkScreenshotLure = analyzeNavigationTarget(
+  "https://haksdkweqw219dms.com/v",
+  "support.stayzltd.com",
+  "https://support.stayzltd.com/agent/stayz/customer-support/tickets/details/299284",
+  {
+    kind: "text-link",
+    label: "https://haksdkweqw219dms.com/v",
+    ticket: {
+      senderEmail: "nataliyaoleynik437@gmail.com",
+      senderDisplayName: "Nataliya Oleynik",
+      subject: "Hotel Room Reservation Status"
+    }
+  }
+);
+assert.equal(bareLinkScreenshotLure.dangerous, true, "bare link to random domain in phishing ticket must flag");
+assert.ok(bareLinkScreenshotLure.confidence >= 70);
+
+// False-positive guard: same phishy ticket context, but the guest links a
+// legitimate (non-random) untrusted host — tier 2 must NOT fire on its own.
+const legitGuestDropboxLink = analyzeNavigationTarget(
+  "https://dropbox.com/s/abc/photos.jpg",
+  "support.stayzltd.com",
+  "https://support.stayzltd.com/agent/stayz/customer-support/tickets/details/299285",
+  {
+    kind: "text-link",
+    label: "https://dropbox.com/s/abc/photos.jpg",
+    ticket: {
+      senderEmail: "realguest@gmail.com",
+      senderDisplayName: "Real Guest",
+      subject: "Hotel Room Reservation Status"
+    }
+  }
+);
+assert.equal(legitGuestDropboxLink.dangerous, false, "plain dropbox link should not flag on context alone");
+
+// ── Trap address hidden in the URL path (share.google obfuscation) ───────────
+assert.equal(
+  checkTrapTokensInUrl(new URL("https://www.google.com/share.google?q=7s92n8Dj0DiQ7xKuU")).dangerous,
+  true,
+  "share.google in the path must be caught"
+);
+assert.equal(
+  checkTrapTokensInUrl(new URL("https://www.google.com/maps/place/Royal+Hotel")).dangerous,
+  false,
+  "ordinary google.com link must not be caught"
+);
+assert.equal(
+  checkTrapTokensInUrl(new URL("https://www.google.com/search?q=hotels")).dangerous,
+  false,
+  "ordinary google search link must not be caught"
+);
+
+// Ticket #338526: bare link reads as google.com but hides share.google in the
+// path. Sender is NOT free webmail, link text is the raw URL, so the heuristic
+// signals score too low — this must be caught by the trap-token-in-URL rule.
+const googleDotComShareGoogleLure = analyzeNavigationTarget(
+  "https://www.google.com/share.google?q=7s92n8Dj0DiQ7xKuU",
+  "support.stayzltd.com",
+  "https://support.stayzltd.com/agent/stayz/customer-support/tickets/details/338526",
+  {
+    kind: "text-link",
+    label: "https://www.google.com/share.google?q=7s92n8Dj0DiQ7xKuU",
+    ticket: {
+      senderEmail: "cs2@jmcht.com",
+      senderDisplayName: "Emily Johnson",
+      subject: "Online reservation could not be completed"
+    }
+  }
+);
+assert.equal(googleDotComShareGoogleLure.dangerous, true, "google.com/share.google lure must flag");
+assert.ok(googleDotComShareGoogleLure.confidence >= 90);
 
 console.log("analysis.test.mjs: all passed");

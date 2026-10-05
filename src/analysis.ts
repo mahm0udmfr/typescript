@@ -65,6 +65,15 @@ export const DOWNLOAD_TRAP_HOST_CONTAINS = [
   "share-google", "sharegoogle", "drive-google"
 ];
 
+// Distinctive trap markers that attackers hide in the PATH or QUERY of an
+// innocent-looking domain to dodge the host-only check and look legitimate to
+// the agent, e.g. https://www.google.com/share.google?q=… — which reads as
+// "google.com" but is really a share.google lure. These strings don't occur in
+// ordinary customer links, so matching them anywhere in the URL is low-FP.
+export const TRAP_URL_PATH_TOKENS = [
+  "share.google", "sharegoogle", "share-google", "drive-google"
+];
+
 export const IMAGE_LURE_HOSTS = [
   "imgur.com", "i.imgur.com", "ibb.co", "i.ibb.co", "postimg.cc", "postimages.org"
 ];
@@ -151,6 +160,36 @@ export function hostsAreRelated(a: string, b: string): boolean {
   const right = normalizeHostname(b);
   if (left === right) return true;
   return left.endsWith("." + right) || right.endsWith("." + left);
+}
+
+/**
+ * Heuristic: does the registrable domain look like a random throwaway host,
+ * e.g. "haksdkweqw219dms.com" or "publick-gstx.com" — the kind of one-off
+ * domain used for a single phishing wave? High precision by design: real
+ * services a guest might legitimately link (drive.google.com, dropbox.com,
+ * wetransfer.com, sharepoint.com) do NOT trip it, so it can safely raise the
+ * risk score without reintroducing false positives on ordinary links.
+ */
+export function looksRandomDomain(hostname: string): boolean {
+  const host = normalizeHostname(hostname);
+  const parts = host.split(".");
+  if (parts.length < 2) return false;
+
+  // Second-level label (the registrable name), minus hyphens.
+  const label = (parts[parts.length - 2] ?? "").replace(/-/g, "");
+  if (label.length < 8) return false;
+
+  const letters = label.replace(/[^a-z]/g, "");
+  const digitCount = (label.match(/\d/g) ?? []).length;
+  if (letters.length === 0) return true; // all-digit label (e.g. a raw-IP-ish host)
+
+  const vowels = (letters.match(/[aeiou]/g) ?? []).length;
+  const vowelRatio = vowels / letters.length;
+  const hasLongConsonantRun = /[bcdfghjklmnpqrstvwxyz]{5,}/.test(letters);
+
+  // Random-looking: too few vowels to be words, a long unpronounceable
+  // consonant run, or a heavy letters+digits mix.
+  return vowelRatio < 0.26 || hasLongConsonantRun || (digitCount >= 3 && letters.length >= 5);
 }
 
 export function isShareGoogleVariant(hostname: string): boolean {
@@ -270,6 +309,35 @@ export function checkDownloadTrapHost(hostname: string): AnalysisResult {
         dangerous: true,
         reason: `Links to "${host}" — may download a file when clicked`,
         confidence: 92
+      };
+    }
+  }
+
+  return { dangerous: false, reason: "", confidence: 0 };
+}
+
+/**
+ * Catch a known trap address that's been hidden inside the PATH or QUERY of an
+ * innocuous-looking domain, e.g. https://www.google.com/share.google?q=… —
+ * an obfuscation of the share.google download trap that reads as "google.com"
+ * and slips past the host-only check above.
+ */
+export function checkTrapTokensInUrl(parsed: URL): AnalysisResult {
+  // De-obfuscate percent-encoding (e.g. %2e → ".", %2d → "-") before matching.
+  let hay = "";
+  try {
+    hay = decodeURIComponent(parsed.pathname + parsed.search).toLowerCase();
+  } catch {
+    hay = (parsed.pathname + parsed.search).toLowerCase();
+  }
+  hay = hay.replace(/%2e/g, ".").replace(/%2d/g, "-");
+
+  for (const token of TRAP_URL_PATH_TOKENS) {
+    if (hay.includes(token)) {
+      return {
+        dangerous: true,
+        reason: `Link hides a known trap address ("${token}") inside the URL`,
+        confidence: 95
       };
     }
   }
@@ -476,7 +544,6 @@ function collectBrandCtaComboSignals(
 ): RiskSignal[] {
   const ticket = context.ticket;
   if (!ticket || isTrustedHost(host, pageHost)) return [];
-  if (!isExternalActionable(host, pageHost, context)) return [];
 
   const senderName = ticket.senderDisplayName?.trim() ?? "";
   const subject = ticket.subject?.trim() ?? "";
@@ -490,10 +557,29 @@ function collectBrandCtaComboSignals(
   const senderMatchesBrand = BRAND_IMPERSONATION_KEYWORDS.some((b) => senderDomain.includes(b));
   if (senderMatchesBrand) return [];
 
-  return [{
-    score: 45,
-    reason: `Email impersonates a known brand but its action button links to an unrelated site (${host})`
-  }];
+  // Tier 1 — an actionable element (button, or a link styled/labelled as a
+  // call to action) pointing at an unrelated site. Strongest signal.
+  if (isExternalActionable(host, pageHost, context)) {
+    return [{
+      score: 45,
+      reason: `Email impersonates a known brand but its action button links to an unrelated site (${host})`
+    }];
+  }
+
+  // Tier 2 — even a PLAIN link (no button styling, no CTA wording) counts when
+  // the sender is a free-webmail account impersonating a brand AND the target
+  // is a random-looking throwaway domain. This catches image/screenshot lures
+  // where the scam text lives inside a picture and the only clickable element
+  // is a bare "https://<random>.com/v" link — which otherwise scores too low.
+  const fromFreeWebmail = senderEmail ? isFreeWebmailHost(senderEmail) : false;
+  if (fromFreeWebmail && looksRandomDomain(host)) {
+    return [{
+      score: 36,
+      reason: `Brand-impersonation email from a free webmail account links to a suspicious domain (${host})`
+    }];
+  }
+
+  return [];
 }
 
 export function analyzeNavigationTarget(
@@ -519,6 +605,15 @@ export function analyzeNavigationTarget(
         };
       }
       return trapHost;
+    }
+
+    // Trap address hidden in the path/query of an innocent-looking host.
+    const trapInUrl = checkTrapTokensInUrl(parsed);
+    if (trapInUrl.dangerous) {
+      if (context.kind === "button-link" || context.kind === "button-element") {
+        return { ...trapInUrl, reason: trapInUrl.reason.replace("Link hides", "Button hides") };
+      }
+      return trapInUrl;
     }
 
     const ext = extensionFromUrlParts(parsed.pathname, parsed.search, parsed.hash);
@@ -585,8 +680,10 @@ if (typeof globalThis !== "undefined") {
       extensionFromUrlParts: typeof extensionFromUrlParts;
       isShareGoogleVariant: typeof isShareGoogleVariant;
       checkDownloadTrapHost: typeof checkDownloadTrapHost;
+      checkTrapTokensInUrl: typeof checkTrapTokensInUrl;
       extractDomainFromText: typeof extractDomainFromText;
       finalizeRiskScore: typeof finalizeRiskScore;
+      looksRandomDomain: typeof looksRandomDomain;
     };
   }).DTGAnalysis = {
     analyzeNavigationTarget,
@@ -598,7 +695,9 @@ if (typeof globalThis !== "undefined") {
     extensionFromUrlParts,
     isShareGoogleVariant,
     checkDownloadTrapHost,
+    checkTrapTokensInUrl,
     extractDomainFromText,
-    finalizeRiskScore
+    finalizeRiskScore,
+    looksRandomDomain
   };
 }

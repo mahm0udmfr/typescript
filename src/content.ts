@@ -70,6 +70,9 @@ interface SerializedRisk {
 
 let lastBannerKey = "";
 let scanTimer: ReturnType<typeof setTimeout> | null = null;
+// Max-wait guard for the debounce: guarantees a scan runs even when Zoho's
+// continuous DOM churn keeps resetting scanTimer (which would otherwise starve it).
+let scanMaxTimer: ReturnType<typeof setTimeout> | null = null;
 let watching = false;
 let startAttempts = 0;
 let lastWatchUrl = "";
@@ -104,6 +107,7 @@ function teardown(): void {
   for (const id of intervals) { try { clearInterval(id); } catch { /* ignore */ } }
   for (const ob of observers) { try { ob.disconnect(); } catch { /* ignore */ } }
   if (scanTimer) { try { clearTimeout(scanTimer); } catch { /* ignore */ } }
+  if (scanMaxTimer) { try { clearTimeout(scanMaxTimer); } catch { /* ignore */ } }
   try { clearWarnings(); } catch { /* ignore */ }
 }
 
@@ -872,10 +876,37 @@ async function scanAndWarn(): Promise<void> {
   }
 }
 
-function scheduleScan(): void {
+const SCAN_DEBOUNCE_MS = 250;   // trailing debounce for ordinary mutations
+const SCAN_MAX_WAIT_MS = 600;   // hard cap so continuous churn can't starve the scan
+const SCAN_LINK_FAST_MS = 60;   // near-immediate when a link/button was just inserted
+
+/** Run a scan now, cancelling any pending debounce/max-wait timers. */
+function runScanNow(): void {
+  if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
+  if (scanMaxTimer) { clearTimeout(scanMaxTimer); scanMaxTimer = null; }
+  void scanAndWarn();
+}
+
+function scheduleScan(delay: number = SCAN_DEBOUNCE_MS): void {
   if (stopped) return;
   if (scanTimer) clearTimeout(scanTimer);
-  scanTimer = setTimeout(() => void scanAndWarn(), 350);
+  scanTimer = setTimeout(runScanNow, delay);
+  // Start the max-wait clock once per burst; whichever timer fires first wins
+  // and runScanNow clears both. This bounds worst-case latency to SCAN_MAX_WAIT_MS
+  // even while Zoho keeps mutating the DOM and resetting the trailing debounce.
+  if (!scanMaxTimer) scanMaxTimer = setTimeout(runScanNow, SCAN_MAX_WAIT_MS);
+}
+
+/** True if any of these mutations inserted a link or button (email body rendering). */
+function mutationsInsertedActionable(muts: MutationRecord[]): boolean {
+  for (const m of muts) {
+    if (m.type !== "childList") continue;
+    for (const n of Array.from(m.addedNodes)) {
+      if (!(n instanceof Element)) continue;
+      if (n.matches?.("a[href], button") || n.querySelector?.("a[href], button")) return true;
+    }
+  }
+  return false;
 }
 
 function onRouteChange(): void {
@@ -903,14 +934,19 @@ function startWatching(): void {
 
   void scanAndWarn();
 
-  const domObserver = new MutationObserver(scheduleScan);
+  const domObserver = new MutationObserver((muts) => {
+    // A freshly inserted link/button is the high-value event (the email body
+    // just rendered) — scan almost immediately instead of waiting out the
+    // debounce, which Zoho's continuous churn would otherwise keep resetting.
+    scheduleScan(mutationsInsertedActionable(muts) ? SCAN_LINK_FAST_MS : SCAN_DEBOUNCE_MS);
+  });
   domObserver.observe(document.documentElement, {
     childList: true, subtree: true, attributes: true,
     attributeFilter: ["href", "src", "onclick", "formaction", "data-href", "data-url"]
   });
   observers.push(domObserver);
 
-  intervals.push(setInterval(() => void scanAndWarn(), 5000));
+  intervals.push(setInterval(() => void scanAndWarn(), 1500));
   intervals.push(setInterval(onRouteChange, 1500));
   // Watchdog: if the extension is reloaded, stop everything quietly.
   intervals.push(setInterval(() => { if (!extensionAlive()) teardown(); }, 2000));
