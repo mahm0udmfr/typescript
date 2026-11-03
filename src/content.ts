@@ -73,16 +73,21 @@ let scanTimer: ReturnType<typeof setTimeout> | null = null;
 // Max-wait guard for the debounce: guarantees a scan runs even when Zoho's
 // continuous DOM churn keeps resetting scanTimer (which would otherwise starve it).
 let scanMaxTimer: ReturnType<typeof setTimeout> | null = null;
+let idleScanHandle: number | null = null;
+// Earliest time the next scan may run; see the budget in scanAndWarn().
+let nextScanAllowedAt = 0;
 let watching = false;
-let startAttempts = 0;
 let lastWatchUrl = "";
 let lastEmailFingerprint = "";
+// Last risk set reported to the service worker, so unchanged results stay quiet.
+let lastReportedKey = "";
 
 // Track timers/observers so we can tear everything down if the extension context
 // is invalidated (e.g. the extension was reloaded while this tab stayed open).
 let stopped = false;
 const intervals: ReturnType<typeof setInterval>[] = [];
-const observers: MutationObserver[] = [];
+let domObserver: MutationObserver | null = null;
+let backstopInterval: ReturnType<typeof setInterval> | null = null;
 
 /**
  * Returns true while the extension's runtime context is still valid.
@@ -105,9 +110,7 @@ function teardown(): void {
   if (stopped) return;
   stopped = true;
   for (const id of intervals) { try { clearInterval(id); } catch { /* ignore */ } }
-  for (const ob of observers) { try { ob.disconnect(); } catch { /* ignore */ } }
-  if (scanTimer) { try { clearTimeout(scanTimer); } catch { /* ignore */ } }
-  if (scanMaxTimer) { try { clearTimeout(scanMaxTimer); } catch { /* ignore */ } }
+  try { stopWatching(); } catch { /* ignore */ }
   try { clearWarnings(); } catch { /* ignore */ }
 }
 
@@ -198,8 +201,21 @@ function deskAncestorState(): "yes" | "no" | "unknown" {
   return "unknown";
 }
 
+/** The top frame's URL, or null when this frame is cross-origin and can't read it. */
+function readableTopUrl(): string | null {
+  try {
+    return window.top?.location.href ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function shouldActivate(): boolean {
-  // Top frame sitting on a ticket-details URL.
+  // Whenever the top URL is readable it decides: this covers the top frame and
+  // same-origin sub-frames, which stay idle on the list view and other Desk pages.
+  const topUrl = readableTopUrl();
+  if (topUrl !== null) return isTicketDetailsUrl(topUrl);
+
   if (isOnTicketPage()) return true;
 
   // Zoho renders email bodies in sub-frames (about:blank, about:srcdoc, or a
@@ -288,11 +304,16 @@ function getTicketContext(): TicketContext {
   // From "Booking.com"<attacker@gmail.com>. Capture the visible display name
   // so brand-impersonation rules work even when there is no mailto: element.
   if (!ctx.senderDisplayName && ctx.senderEmail) {
-    const bodyText = document.body?.textContent ?? "";
-    const idx = bodyText.toLowerCase().indexOf(ctx.senderEmail);
-    if (idx >= 0) {
-      const windowText = bodyText.slice(Math.max(0, idx - 90), idx + ctx.senderEmail.length);
-      ctx.senderDisplayName = extractDisplayName(windowText);
+    if (ctxCache?.senderEmail === ctx.senderEmail && ctxCache.senderDisplayName) {
+      // Same sender as last time: skip re-reading the whole page's text.
+      ctx.senderDisplayName = ctxCache.senderDisplayName;
+    } else {
+      const bodyText = document.body?.textContent ?? "";
+      const idx = bodyText.toLowerCase().indexOf(ctx.senderEmail);
+      if (idx >= 0) {
+        const windowText = bodyText.slice(Math.max(0, idx - 90), idx + ctx.senderEmail.length);
+        ctx.senderDisplayName = extractDisplayName(windowText);
+      }
     }
   }
 
@@ -408,41 +429,31 @@ function inListPanel(el: Element): boolean {
 
 // ── DOM walkers ────────────────────────────────────────────────────────────
 
-function allAnchorsIn(root: Node): HTMLAnchorElement[] {
-  const out: HTMLAnchorElement[] = [];
-  const seen = new Set<HTMLAnchorElement>();
-  function walk(n: Node): void {
-    if (n instanceof HTMLAnchorElement) {
-      const h = n.getAttribute("href") ?? n.href;
-      if (h && !isIgnorableHref(h) && !seen.has(n)) { seen.add(n); out.push(n); }
+/**
+ * Collect links and buttons under root, including open shadow roots, in one pass.
+ * Iframes are not entered: each frame runs its own copy of this script, and
+ * `instanceof` is false for another frame's elements, so entering them finds nothing.
+ */
+function collectActionable(
+  root: Element | ShadowRoot,
+  anchors: HTMLAnchorElement[],
+  buttons: HTMLElement[]
+): void {
+  const visit = (el: Element): void => {
+    if (el instanceof HTMLAnchorElement) {
+      const h = el.getAttribute("href") ?? el.href;
+      if (h && !isIgnorableHref(h)) anchors.push(el);
+    } else if (
+      el instanceof HTMLButtonElement ||
+      (el instanceof HTMLInputElement && (el.type === "button" || el.type === "submit"))
+    ) {
+      buttons.push(el);
     }
-    if (n instanceof HTMLIFrameElement) {
-      try { const d = n.contentDocument; if (d?.body) walk(d.body); } catch { /* cross-origin */ }
-    }
-    if (n instanceof Element && n.shadowRoot) walk(n.shadowRoot);
-    n.childNodes.forEach(walk);
-  }
-  walk(root);
-  return out;
-}
-
-function allButtonsIn(root: Node): HTMLElement[] {
-  const out: HTMLElement[] = [];
-  const seen = new Set<HTMLElement>();
-  function walk(n: Node): void {
-    if (n instanceof HTMLElement) {
-      const isBtn = n instanceof HTMLButtonElement ||
-        (n instanceof HTMLInputElement && (n.type === "button" || n.type === "submit"));
-      if (isBtn && !seen.has(n)) { seen.add(n); out.push(n); }
-      if (n instanceof HTMLIFrameElement) {
-        try { const d = n.contentDocument; if (d?.body) walk(d.body); } catch { /* cross-origin */ }
-      }
-      if (n.shadowRoot) walk(n.shadowRoot);
-    }
-    n.childNodes.forEach(walk);
-  }
-  walk(root);
-  return out;
+    if (el.shadowRoot) collectActionable(el.shadowRoot, anchors, buttons);
+  };
+  if (root instanceof Element) visit(root);
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+  while (walker.nextNode()) visit(walker.currentNode as Element);
 }
 
 // ── Risk analysis ──────────────────────────────────────────────────────────
@@ -464,30 +475,63 @@ function pushRisk(
   risks.push({ element: el, targetUrl: url, displayLabel: label, reason: analysis.reason, confidence: analysis.confidence, kind });
 }
 
+interface AnchorVerdict {
+  kind: string;
+  analysis: { dangerous: boolean; reason: string; confidence: number };
+}
+
+// Verdicts for links whose inputs haven't changed. Re-checking a link forces
+// style and layout reads, so unchanged links reuse their last answer.
+let anchorCache = new WeakMap<HTMLAnchorElement, { signature: string; verdicts: AnchorVerdict[] }>();
+
+/** Everything an anchor's verdict depends on, read without forcing layout. */
+function anchorSignature(a: HTMLAnchorElement, url: string, label: string, host: string): string {
+  const ticket = getTicketContext();
+  const imgs = Array.from(a.getElementsByTagName("img"))
+    .map((img) => `${img.src}:${img.complete}:${img.naturalWidth}`)
+    .join(",");
+  return [
+    url, label, host, a.className, a.getAttribute("style"), a.getAttribute("role"), imgs,
+    ticket.senderEmail, ticket.senderDisplayName, ticket.subject
+  ].join("\n");
+}
+
+function evaluateAnchor(a: HTMLAnchorElement, url: string, label: string, host: string): AnchorVerdict[] {
+  const btnStyled = isButtonStyled(a);
+  const imgs = Array.from(a.querySelectorAll("img")).filter((i): i is HTMLImageElement => i instanceof HTMLImageElement);
+  const verdicts: AnchorVerdict[] = [];
+
+  for (const img of imgs) {
+    if (isTrackingPixel(img)) continue;
+    const { w, h } = getImgSize(img);
+    verdicts.push({
+      kind: "image-link",
+      analysis: DTG().analyzeNavigationTarget(url, host, window.location.href,
+        ctx({ kind: "image-link", imgSrc: img.src, imgWidth: w, imgHeight: h, label, buttonStyled: btnStyled }) as never)
+    });
+  }
+  if (verdicts.length > 0) return verdicts;
+
+  const kind = btnStyled ? "button-link" : "text-link";
+  return [{
+    kind,
+    analysis: DTG().analyzeNavigationTarget(url, host, window.location.href,
+      ctx({ kind, label, buttonStyled: btnStyled }) as never)
+  }];
+}
+
 function analyzeAnchor(a: HTMLAnchorElement, host: string, seen: Set<string>, risks: RiskyTarget[]): void {
   const url = getLinkUrl(a);
   if (isIgnorableHref(url)) return;
   const label = getLabel(a);
-  const btnStyled = isButtonStyled(a);
-  const imgs = Array.from(a.querySelectorAll("img")).filter((i): i is HTMLImageElement => i instanceof HTMLImageElement);
+  const signature = anchorSignature(a, url, label, host);
 
-  if (imgs.length > 0) {
-    let analyzed = false;
-    for (const img of imgs) {
-      if (isTrackingPixel(img)) continue;
-      analyzed = true;
-      const { w, h } = getImgSize(img);
-      const r = DTG().analyzeNavigationTarget(url, host, window.location.href,
-        ctx({ kind: "image-link", imgSrc: img.src, imgWidth: w, imgHeight: h, label, buttonStyled: btnStyled }) as never);
-      pushRisk(seen, risks, a, url, r, "image-link");
-    }
-    if (analyzed) return;
+  let cached = anchorCache.get(a);
+  if (!cached || cached.signature !== signature) {
+    cached = { signature, verdicts: evaluateAnchor(a, url, label, host) };
+    anchorCache.set(a, cached);
   }
-
-  const kind = btnStyled ? "button-link" : "text-link";
-  const r = DTG().analyzeNavigationTarget(url, host, window.location.href,
-    ctx({ kind, label, buttonStyled: btnStyled }) as never);
-  pushRisk(seen, risks, a, url, r, kind);
+  for (const { kind, analysis } of cached.verdicts) pushRisk(seen, risks, a, url, analysis, kind);
 }
 
 function analyzeButton(el: HTMLElement, host: string, seen: Set<string>, risks: RiskyTarget[]): void {
@@ -500,41 +544,27 @@ function analyzeButton(el: HTMLElement, host: string, seen: Set<string>, risks: 
 }
 
 function scanRoot(root: Element, host: string, seen: Set<string>, risks: RiskyTarget[]): void {
-  const anchorsSeen = new Set<HTMLAnchorElement>();
-  const btnSeen = new Set<HTMLElement>();
+  const anchors: HTMLAnchorElement[] = [];
+  const buttons: HTMLElement[] = [];
+  collectActionable(root, anchors, buttons);
 
-  for (const a of allAnchorsIn(root)) {
-    if (anchorsSeen.has(a)) continue;
-    anchorsSeen.add(a);
-    analyzeAnchor(a, host, seen, risks);
-  }
+  for (const a of anchors) analyzeAnchor(a, host, seen, risks);
 
-  for (const btn of allButtonsIn(root)) {
-    if (btnSeen.has(btn)) continue;
-    btnSeen.add(btn);
+  for (const btn of buttons) {
     if (btn.closest("a[href]") instanceof HTMLAnchorElement) continue;
     analyzeButton(btn, host, seen, risks);
-  }
-
-  // Fast path: directly query known trap URLs
-  for (const sel of ['a[href*="share.google"]', 'a[href*="share-google"]', '[data-href*="share.google"]']) {
-    root.querySelectorAll(sel).forEach((node) => {
-      if (!(node instanceof HTMLAnchorElement) || anchorsSeen.has(node)) return;
-      if (inListPanel(node)) return;
-      anchorsSeen.add(node);
-      analyzeAnchor(node, host, seen, risks);
-    });
   }
 
   // Clickable images not inside <a>
   root.querySelectorAll("img").forEach((node) => {
     if (!(node instanceof HTMLImageElement)) return;
-    if (isTrackingPixel(node)) return;
     if (node.closest("a[href]")) return;
     let el: HTMLElement | null = node;
     for (let d = 0; el && d < 6; d++, el = el.parentElement) {
       const dh = el.getAttribute("data-href") || el.getAttribute("data-url") || el.getAttribute("onclick");
       if (!dh) continue;
+      // Measured only once a click target exists, because sizing forces layout.
+      if (isTrackingPixel(node)) return;
       const urls = dh.startsWith("http") ? [dh] : DTG().extractUrlsFromOnclick(dh);
       for (const url of urls) {
         const { w, h } = getImgSize(node);
@@ -556,14 +586,14 @@ function scanRoot(root: Element, host: string, seen: Set<string>, risks: RiskyTa
 function getScanRoots(): Element[] {
   if (window !== window.top) return document.body ? [document.body] : [];
 
+  // One combined query returns document order, so outer containers come first
+  // and nested matches are skipped instead of being scanned twice.
   const roots: Element[] = [];
-  for (const sel of EMAIL_CONTENT_SELECTORS) {
-    document.querySelectorAll(sel).forEach((el) => {
-      if (el.closest(LIST_EXCLUDE)) return;
-      if (roots.some((r) => r.contains(el))) return; // skip nested duplicates
-      roots.push(el);
-    });
-  }
+  document.querySelectorAll(EMAIL_CONTENT_SELECTORS.join(",")).forEach((el) => {
+    if (roots.some((r) => r.contains(el))) return;
+    if (el.closest(LIST_EXCLUDE)) return;
+    roots.push(el);
+  });
 
   if (roots.length === 0 && document.body) return [document.body];
   return roots;
@@ -703,7 +733,7 @@ async function showPanel(risks: SerializedRisk[]): Promise<void> {
   let logoUrl = "";
   try {
     if (extensionAlive() && chrome.runtime?.getURL) {
-      logoUrl = chrome.runtime.getURL("cbs-hunter-logo.png");
+      logoUrl = chrome.runtime.getURL("cbs-hunter-logo-small.png");
     }
   } catch { /* context invalidated — render without logo */ }
 
@@ -794,12 +824,9 @@ function emailFingerprint(): string {
   // Prefer the dedicated email content container; fall back to the ticket-detail RHS panel.
   const EMAIL_SELECTORS = EMAIL_CONTENT_SELECTORS;
   const visibleTextWithoutHunterUi = (el: Element): string => {
-    const clone = el.cloneNode(true);
-    if (!(clone instanceof Element)) return "";
-    // Ignore our injected badges/panel; otherwise the second scan sees "TRAP"
-    // as new email text, clears the panel, and replays the warning animation.
-    clone.querySelectorAll("[data-cbs-badge], #cbs-hunter-panel").forEach((n) => n.remove());
-    return clone.textContent?.replace(/\s+/g, " ").trim().slice(0, 200) ?? "";
+    // Ignore our injected badges; otherwise the second scan sees "TRAP" as new
+    // email text, clears the panel, and replays the warning animation.
+    return el.textContent?.replace(/⚠\s*TRAP/g, "").replace(/\s+/g, " ").trim().slice(0, 200) ?? "";
   };
   for (const sel of EMAIL_SELECTORS) {
     const el = document.querySelector(sel);
@@ -818,6 +845,10 @@ async function scanAndWarn(): Promise<void> {
     // Stop entirely if the extension was reloaded/updated under us.
     if (!extensionAlive()) { teardown(); return; }
     if (!shouldActivate()) return;
+    // Background tabs wait; the visibilitychange listener scans when they return.
+    if (document.hidden) return;
+
+    const scanStartedAt = performance.now();
 
     // Detect when Zoho switches to a different conversation (same URL, different content).
     // Do NOT clear the panel yet: Zoho can mutate the same email during load.
@@ -830,11 +861,19 @@ async function scanAndWarn(): Promise<void> {
     }
 
     const risks = findRiskyTargets();
+
+    // Slow scans wait longer before the next one, which caps the CPU spent
+    // scanning on any laptop or ticket size.
+    const scanCost = performance.now() - scanStartedAt;
+    nextScanAllowedAt = performance.now() + Math.min(scanCost * SCAN_BUDGET_FACTOR, SCAN_BACKSTOP_MS);
+
     if (risks.length === 0) {
       if (contentChanged) {
         clearWarnings();
         lastBannerKey = "";
       }
+      lastReportedKey = "";
+      activeHighlights = activeHighlights.filter((h) => h.element.isConnected);
       return;
     }
 
@@ -851,16 +890,19 @@ async function scanAndWarn(): Promise<void> {
       // Main frame: show the CBS Hunter panel directly.
       await showPanel(serialized);
     } else {
-      // Sub-frame (email iframe): send risks up to the main frame.
+      // Sub-frame (email iframe): send risks to the main frame, which may be more
+      // than one level up.
       try {
-        window.parent.postMessage(
+        window.top?.postMessage(
           { type: "CBS_HUNTER_IFRAME_RISKS", risks: serialized },
           "*"
         );
       } catch { /* cross-origin parent blocked postMessage */ }
     }
 
-    if (extensionAlive()) {
+    const reportKey = panelKey(serialized);
+    if (reportKey !== lastReportedKey && extensionAlive()) {
+      lastReportedKey = reportKey;
       try {
         chrome.runtime.sendMessage({
           type: "DOWNLOAD_TRAP_DETECTED",
@@ -879,115 +921,141 @@ async function scanAndWarn(): Promise<void> {
 const SCAN_DEBOUNCE_MS = 250;   // trailing debounce for ordinary mutations
 const SCAN_MAX_WAIT_MS = 600;   // hard cap so continuous churn can't starve the scan
 const SCAN_LINK_FAST_MS = 60;   // near-immediate when a link/button was just inserted
+const SCAN_BACKSTOP_MS = 5000;  // periodic scan for changes the observer can't see
+const SCAN_BUDGET_FACTOR = 10;  // idle at least 10x the last scan's cost (about 10% CPU at most)
+const SCAN_IDLE_TIMEOUT_MS = 500; // longest a due scan waits for the page to go idle
+const ROUTE_POLL_MS = 500;      // Desk changes tickets in-app, without a page load
 
-/** Run a scan now, cancelling any pending debounce/max-wait timers. */
+// Elements a scan can act on. Mutations without any of these can't change the result.
+const SCAN_RELEVANT_SELECTOR =
+  "a[href], button, input[type='button'], input[type='submit'], img, [data-href], [data-url], [onclick]";
+
+/**
+ * Run a scan at the browser's next idle moment, so it doesn't interrupt an agent
+ * who is typing. The timeout makes sure a busy page can't delay a warning for long.
+ */
 function runScanNow(): void {
   if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
   if (scanMaxTimer) { clearTimeout(scanMaxTimer); scanMaxTimer = null; }
-  void scanAndWarn();
+  if (idleScanHandle !== null) return;
+  idleScanHandle = requestIdleCallback(() => {
+    idleScanHandle = null;
+    void scanAndWarn();
+  }, { timeout: SCAN_IDLE_TIMEOUT_MS });
 }
 
 function scheduleScan(delay: number = SCAN_DEBOUNCE_MS): void {
   if (stopped) return;
+  const budgetWait = Math.max(0, nextScanAllowedAt - performance.now());
   if (scanTimer) clearTimeout(scanTimer);
-  scanTimer = setTimeout(runScanNow, delay);
+  scanTimer = setTimeout(runScanNow, Math.max(delay, budgetWait));
   // Start the max-wait clock once per burst; whichever timer fires first wins
-  // and runScanNow clears both. This bounds worst-case latency to SCAN_MAX_WAIT_MS
-  // even while Zoho keeps mutating the DOM and resetting the trailing debounce.
-  if (!scanMaxTimer) scanMaxTimer = setTimeout(runScanNow, SCAN_MAX_WAIT_MS);
+  // and runScanNow clears both. Continuous churn can't keep postponing the scan.
+  if (!scanMaxTimer) scanMaxTimer = setTimeout(runScanNow, Math.max(SCAN_MAX_WAIT_MS, budgetWait));
 }
 
-/** True if any of these mutations inserted a link or button (email body rendering). */
-function mutationsInsertedActionable(muts: MutationRecord[]): boolean {
+/** How soon these mutations need a scan, or null if they can't affect the result. */
+function scanDelayForMutations(muts: MutationRecord[]): number | null {
+  let delay: number | null = null;
   for (const m of muts) {
-    if (m.type !== "childList") continue;
+    if (m.target instanceof Element && m.target.closest(`#${PANEL_ID}`)) continue;
+    if (m.type === "attributes") {
+      delay = SCAN_DEBOUNCE_MS;
+      continue;
+    }
     for (const n of Array.from(m.addedNodes)) {
       if (!(n instanceof Element)) continue;
-      if (n.matches?.("a[href], button") || n.querySelector?.("a[href], button")) return true;
+      if (n.id === PANEL_ID || n.hasAttribute("data-cbs-badge")) continue;
+      if (n.matches(SCAN_RELEVANT_SELECTOR) || n.querySelector(SCAN_RELEVANT_SELECTOR)) return SCAN_LINK_FAST_MS;
     }
   }
-  return false;
+  // A flagged link was removed, so the warning may need clearing.
+  if (delay === null && activeHighlights.some((h) => !h.element.isConnected)) return SCAN_DEBOUNCE_MS;
+  return delay;
+}
+
+/** The URL that decides this frame's route: the top frame's when it's readable. */
+function currentRouteUrl(): string {
+  return readableTopUrl() ?? location.href;
 }
 
 function onRouteChange(): void {
-  const url = location.href;
+  const url = currentRouteUrl();
   if (url === lastWatchUrl) return;
   lastWatchUrl = url;
   ctxCache = null; ctxTs = 0;
+  anchorCache = new WeakMap();
+  lastReportedKey = "";
   clearWarnings();
   lastBannerKey = "";
-  if (!watching) { startAttempts = 0; startWatching(); }
-  else void scanAndWarn();
+  refreshActivation();
 }
 
 function startWatching(): void {
   if (watching) return;
-  if (!DTG()) return;
-  if (!shouldActivate()) {
-    if (startAttempts++ < 60) setTimeout(startWatching, 800);
-    return;
-  }
-
   watching = true;
-  lastWatchUrl = location.href;
   console.info("[DTG] watching:", location.href);
 
-  void scanAndWarn();
-
-  const domObserver = new MutationObserver((muts) => {
-    // A freshly inserted link/button is the high-value event (the email body
-    // just rendered) — scan almost immediately instead of waiting out the
-    // debounce, which Zoho's continuous churn would otherwise keep resetting.
-    scheduleScan(mutationsInsertedActionable(muts) ? SCAN_LINK_FAST_MS : SCAN_DEBOUNCE_MS);
+  domObserver = new MutationObserver((muts) => {
+    const delay = scanDelayForMutations(muts);
+    if (delay !== null) scheduleScan(delay);
   });
   domObserver.observe(document.documentElement, {
     childList: true, subtree: true, attributes: true,
     attributeFilter: ["href", "src", "onclick", "formaction", "data-href", "data-url"]
   });
-  observers.push(domObserver);
 
-  intervals.push(setInterval(() => void scanAndWarn(), 1500));
-  intervals.push(setInterval(onRouteChange, 1500));
-  // Watchdog: if the extension is reloaded, stop everything quietly.
-  intervals.push(setInterval(() => { if (!extensionAlive()) teardown(); }, 2000));
-
-  // Delayed scans — email content in Zoho often loads 1-5s after document_idle
-  for (const ms of [300, 800, 1500, 2500, 4000, 7000, 12000, 20000]) {
-    setTimeout(() => void scanAndWarn(), ms);
-  }
-
-  // Attach to iframes when they load
-  const attachFrame = (frame: HTMLIFrameElement): void => {
-    frame.addEventListener("load", () => { setTimeout(() => void scanAndWarn(), 300); });
-    setTimeout(() => void scanAndWarn(), 800);
-  };
-  document.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
-  const iframeObserver = new MutationObserver((muts) => {
-    for (const m of muts) m.addedNodes.forEach((n) => {
-      if (n instanceof HTMLIFrameElement) attachFrame(n);
-      if (n instanceof Element) n.querySelectorAll("iframe").forEach((f) => attachFrame(f as HTMLIFrameElement));
-    });
-  });
-  iframeObserver.observe(document.documentElement, { childList: true, subtree: true });
-  observers.push(iframeObserver);
+  backstopInterval = setInterval(() => scheduleScan(0), SCAN_BACKSTOP_MS);
 }
 
-// Expose rescan hook so the IIFE guard can call it on re-injection
-(globalThis as typeof globalThis & { __dtgRescan?: () => void }).__dtgRescan = () => {
-  ctxCache = null;
-  ctxTs = 0;
-  lastBannerKey = "";
-  lastEmailFingerprint = "";
-  void scanAndWarn();
-};
+function stopWatching(): void {
+  watching = false;
+  domObserver?.disconnect();
+  domObserver = null;
+  if (backstopInterval) { clearInterval(backstopInterval); backstopInterval = null; }
+  if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
+  if (scanMaxTimer) { clearTimeout(scanMaxTimer); scanMaxTimer = null; }
+  if (idleScanHandle !== null) { cancelIdleCallback(idleScanHandle); idleScanHandle = null; }
+}
+
+/** Start or stop scanning to match the current page, then scan if it's a ticket. */
+function refreshActivation(): void {
+  if (!shouldActivate()) {
+    stopWatching();
+    return;
+  }
+  startWatching();
+  scheduleScan(0);
+  // Follow-up scans for email content that loads without a relevant DOM change.
+  for (const ms of [300, 1500, 4000]) {
+    setTimeout(() => scheduleScan(0), ms);
+  }
+}
+
+/**
+ * Runs for the life of the page, whatever page it starts on. The route check must
+ * not depend on activation: a tab opened on the ticket list has to notice when
+ * the agent later clicks into a ticket, however long that takes.
+ */
+function boot(): void {
+  if (!DTG()) return;
+  lastWatchUrl = currentRouteUrl();
+  intervals.push(setInterval(onRouteChange, ROUTE_POLL_MS));
+  // Watchdog: if the extension is reloaded, stop everything quietly.
+  intervals.push(setInterval(() => { if (!extensionAlive()) teardown(); }, 2000));
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && watching) scheduleScan(0);
+  });
+  refreshActivation();
+}
 
 // Boot
 {
   const g = globalThis as typeof globalThis & { __dtgInit?: boolean };
   if (!g.__dtgInit) {
     g.__dtgInit = true;
-    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", startWatching);
-    else startWatching();
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+    else boot();
   }
 }
 
@@ -1003,6 +1071,7 @@ if (window === window.top) {
     if (!e.data || e.data.type !== "CBS_HUNTER_IFRAME_RISKS") return;
     const risks = e.data.risks as SerializedRisk[];
     if (!Array.isArray(risks) || risks.length === 0) return;
+    if (!shouldActivate()) return; // a late report from a ticket the agent already left
     showPanel(risks).catch(() => { /* never let the panel reject uncaught */ });
   });
 }

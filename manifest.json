@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Download Trap Guard",
-  "version": "1.0.3",
+  "version": "1.0.5",
   "description": "Warns when a Zoho Desk ticket has a suspicious image, link, or button that triggers a file download.",
-  "permissions": ["storage", "scripting"],
+  "permissions": ["storage"],
   "host_permissions": [
     "*://*.stayzltd.com/*",
     "*://desk.zoho.com/*",
@@ -48,7 +48,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["cbs-hunter-logo.png"],
+      "resources": ["cbs-hunter-logo-small.png"],
       "matches": ["*://*.stayzltd.com/*", "*://desk.zoho.com/*", "*://desk.zoho.eu/*", "*://desk.zohocloud.ca/*", "*://*.zohodesk.com/*", "*://*.zohopublic.com/*"]
     }
   ],

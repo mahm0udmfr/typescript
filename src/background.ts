@@ -65,32 +65,3 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   return false;
 });
-
-function isTicketTabUrl(url: string): boolean {
-  try {
-    return new URL(url).pathname.toLowerCase().includes("/tickets/details/");
-  } catch {
-    return false;
-  }
-}
-
-const reinjectCooldown = new Set<number>();
-
-chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
-  if (info.status !== "complete" || !tab.url || !isTicketTabUrl(tab.url)) return;
-  if (reinjectCooldown.has(tabId)) return;
-  reinjectCooldown.add(tabId);
-  setTimeout(() => reinjectCooldown.delete(tabId), 5000);
-
-  // Re-inject after a short delay so email content is loaded.
-  // The IIFE guard in content.js will call __dtgRescan() instead of
-  // re-running the full script, triggering a fresh scan cheaply.
-  setTimeout(() => {
-    void chrome.scripting
-      .executeScript({
-        target: { tabId, allFrames: true },
-        files: ["analysis.js", "content.js"]
-      })
-      .catch(() => {});
-  }, 1500);
-});

@@ -16,10 +16,6 @@ Download Trap Guard warns Zoho Desk support agents when a ticket contains clicka
 
 Session-only local data: dismissed warning banners, a rolling log of up to 50 detections (page URL, count, timestamp) for the extension badge, and per-tab risk results to show the banner. Not transmitted off-device.
 
-### `scripting`
-
-Re-injects the content script on Zoho Desk ticket detail pages after the page loads so ticket email content in iframes can be scanned. Only runs when the tab URL contains `/tickets/details/`.
-
 ### Host permissions
 
 | Pattern | Justification |

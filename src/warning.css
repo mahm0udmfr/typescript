@@ -48,7 +48,7 @@
   height: 58px !important;
   object-fit: contain !important;
   flex-shrink: 0 !important;
-  filter: drop-shadow(0 0 8px rgba(232,200,74,0.32)) drop-shadow(0 2px 4px rgba(0,0,0,0.55)) !important;
+  filter: drop-shadow(0 0 8px rgba(232,200,74,0.32)) !important;
 }
 
 #cbs-hunter-panel .cbs-brand {
@@ -293,9 +293,10 @@
 
 /* ── Threat badge injected next to each flagged element ─────────────────── */
 
+/* Opacity only: animating box-shadow repaints constantly, which is slow on weak laptops. */
 @keyframes cbs-badge-pulse {
-  0%, 100% { opacity: 1; box-shadow: 0 0 6px rgba(239,68,68,0.7); }
-  50%       { opacity: 0.82; box-shadow: 0 0 14px rgba(239,68,68,1); }
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.72; }
 }
 
 .cbs-threat-badge {
@@ -319,6 +320,7 @@
   cursor: default !important;
   pointer-events: none !important;
   line-height: 1 !important;
+  box-shadow: 0 0 10px rgba(239,68,68,0.85) !important;
   animation: cbs-badge-pulse 2s ease-in-out infinite !important;
 }
 

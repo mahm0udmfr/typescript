@@ -91,7 +91,6 @@ Nothing in this storage is synced to the cloud by the extension.
 | Permission | Why it is needed |
 |------------|------------------|
 | `storage` | Session-only data described above (dismiss state, detection log, per-tab risks). |
-| `scripting` | Re-inject the scanner on Zoho Desk ticket detail pages after content loads (including email iframes). Runs only when the tab URL contains `/tickets/details/`. |
 | Host access on Zoho and Stayz domains | Inject the content script on Zoho Desk portals and embedded Zoho frames where ticket messages appear. |
 
 **Host patterns in the manifest:**
