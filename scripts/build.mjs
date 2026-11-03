@@ -8,7 +8,11 @@ const dist = join(root, "dist");
 
 mkdirSync(dist, { recursive: true });
 
-spawnSync("node", [join(root, "scripts", "generate-icons.mjs")], { stdio: "inherit" });
+const icons = spawnSync("node", [join(root, "scripts", "generate-icons.mjs")], { stdio: "inherit" });
+if (icons.status !== 0) {
+  console.error("Icon generation failed, so the build stopped. Run `npm install` and try again.");
+  process.exit(1);
+}
 
 copyFileSync(join(root, "manifest.json"), join(dist, "manifest.json"));
 copyFileSync(join(root, "src", "warning.css"), join(dist, "warning.css"));
