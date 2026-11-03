@@ -81,6 +81,10 @@ let lastWatchUrl = "";
 let lastEmailFingerprint = "";
 // Last risk set reported to the service worker, so unchanged results stay quiet.
 let lastReportedKey = "";
+// Top frame only: the sub-frame that last reported risks, and when.
+const FRAME_RISK_FRESH_MS = 15000; // frames report at least this often while flagged
+let lastFrameRiskSource: Window | null = null;
+let lastFrameRiskAt = 0;
 
 // Track timers/observers so we can tear everything down if the extension context
 // is invalidated (e.g. the extension was reloaded while this tab stayed open).
@@ -838,6 +842,15 @@ function emailFingerprint(): string {
   return "";
 }
 
+/**
+ * Is a sub-frame still reporting the warning in the panel? The top frame can't see
+ * inside iframes, so without this its own clean scan would clear their warnings.
+ */
+function frameWarningLive(): boolean {
+  if (!lastFrameRiskSource || lastFrameRiskSource.closed) return false;
+  return Date.now() - lastFrameRiskAt < FRAME_RISK_FRESH_MS;
+}
+
 async function scanAndWarn(): Promise<void> {
   // Wrap the ENTIRE body so the scan loop can never produce an uncaught promise
   // rejection — e.g. "Extension context invalidated" after the extension reloads.
@@ -868,9 +881,12 @@ async function scanAndWarn(): Promise<void> {
     nextScanAllowedAt = performance.now() + Math.min(scanCost * SCAN_BUDGET_FACTOR, SCAN_BACKSTOP_MS);
 
     if (risks.length === 0) {
-      if (contentChanged) {
+      if (frameWarningLive()) {
+        if (contentChanged) clearHighlights();
+      } else if (contentChanged || lastFrameRiskSource) {
         clearWarnings();
         lastBannerKey = "";
+        lastFrameRiskSource = null;
       }
       lastReportedKey = "";
       activeHighlights = activeHighlights.filter((h) => h.element.isConnected);
@@ -881,40 +897,45 @@ async function scanAndWarn(): Promise<void> {
     // without removing the already-visible panel (prevents double animation).
     if (contentChanged) clearHighlights();
 
-    // Always apply element highlights in the current frame.
-    applyHighlights(risks);
-
-    const serialized = serializeRisks(risks);
-
-    if (window === window.top) {
-      // Main frame: show the CBS Hunter panel directly.
-      await showPanel(serialized);
-    } else {
-      // Sub-frame (email iframe): send risks to the main frame, which may be more
-      // than one level up.
-      try {
-        window.top?.postMessage(
-          { type: "CBS_HUNTER_IFRAME_RISKS", risks: serialized },
-          "*"
-        );
-      } catch { /* cross-origin parent blocked postMessage */ }
-    }
-
-    const reportKey = panelKey(serialized);
-    if (reportKey !== lastReportedKey && extensionAlive()) {
-      lastReportedKey = reportKey;
-      try {
-        chrome.runtime.sendMessage({
-          type: "DOWNLOAD_TRAP_DETECTED",
-          count: risks.length,
-          url: window.location.href,
-          frame: window !== window.top
-        });
-      } catch { /* ignore */ }
-    }
+    await publishRisks(risks);
   } catch {
     // Any failure (context loss, DOM rejection) — stop the orphaned script quietly.
     teardown();
+  }
+}
+
+/** Highlight risks in this frame, show the panel, and report changes to the service worker. */
+async function publishRisks(risks: RiskyTarget[]): Promise<void> {
+  // Always apply element highlights in the current frame.
+  applyHighlights(risks);
+
+  const serialized = serializeRisks(risks);
+
+  const reportKey = panelKey(serialized);
+  if (reportKey !== lastReportedKey && extensionAlive()) {
+    lastReportedKey = reportKey;
+    try {
+      chrome.runtime.sendMessage({
+        type: "DOWNLOAD_TRAP_DETECTED",
+        count: risks.length,
+        url: window.location.href,
+        frame: window !== window.top
+      });
+    } catch { /* ignore */ }
+  }
+
+  if (window === window.top) {
+    // Main frame: show the CBS Hunter panel directly.
+    await showPanel(serialized);
+  } else {
+    // Sub-frame (email iframe): send risks to the main frame, which may be more
+    // than one level up.
+    try {
+      window.top?.postMessage(
+        { type: "CBS_HUNTER_IFRAME_RISKS", risks: serialized },
+        "*"
+      );
+    } catch { /* cross-origin parent blocked postMessage */ }
   }
 }
 
@@ -986,6 +1007,7 @@ function onRouteChange(): void {
   ctxCache = null; ctxTs = 0;
   anchorCache = new WeakMap();
   lastReportedKey = "";
+  lastFrameRiskSource = null;
   clearWarnings();
   lastBannerKey = "";
   refreshActivation();
@@ -1072,6 +1094,8 @@ if (window === window.top) {
     const risks = e.data.risks as SerializedRisk[];
     if (!Array.isArray(risks) || risks.length === 0) return;
     if (!shouldActivate()) return; // a late report from a ticket the agent already left
+    lastFrameRiskSource = e.source as Window | null;
+    lastFrameRiskAt = Date.now();
     showPanel(risks).catch(() => { /* never let the panel reject uncaught */ });
   });
 }
@@ -1095,6 +1119,51 @@ function getFlagged(target: Element | null): { el: HTMLElement; url: string } | 
   return { el, url };
 }
 
+// What an agent can click to leave the page. Other clicks skip the check entirely.
+const CLICK_CHECK_SELECTOR =
+  "a[href], button, input[type='button'], input[type='submit'], [data-href], [data-url], [onclick]";
+
+/** Is el inside root, looking through any open shadow roots in between? */
+function isInsideRoot(root: Element, el: Element): boolean {
+  let current: Element = el;
+  for (;;) {
+    if (root.contains(current)) return true;
+    const node = current.getRootNode();
+    if (!(node instanceof ShadowRoot)) return false;
+    current = node.host;
+  }
+}
+
+/**
+ * Decide at the moment of the click, so a link can't be followed in the gap before
+ * the next scan runs. Any failure lets the click through: agents must never get
+ * stuck on an ordinary link because of an error in here.
+ */
+function checkBeforeClick(e: Event): { el: HTMLElement; url: string } | null {
+  try {
+    if (stopped) return null;
+    const target = e.composedPath()[0];
+    if (!(target instanceof Element)) return null;
+
+    const known = getFlagged(target);
+    if (known) return known;
+
+    const clicked = target.closest(CLICK_CHECK_SELECTOR);
+    if (!clicked || clicked.closest(`#${PANEL_ID}`)) return null;
+    if (!shouldActivate() || !DTG()) return null;
+    if (!getScanRoots().some((root) => isInsideRoot(root, clicked))) return null;
+
+    ctxTs = 0; // read the sender again: it may have rendered since the last scan
+    const risks = findRiskyTargets();
+    if (risks.length === 0) return null;
+
+    void publishRisks(risks).catch(() => { /* the click decision below still stands */ });
+    return getFlagged(target);
+  } catch {
+    return null;
+  }
+}
+
 function block(e: Event, dest: string): void {
   if (window.confirm(
     "DOWNLOAD TRAP WARNING\n\nThis may download malware when clicked.\n\n" +
@@ -1104,16 +1173,17 @@ function block(e: Event, dest: string): void {
   e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
 }
 
-document.addEventListener("click", (e) => { const h = getFlagged(e.target as Element); if (h) block(e, h.url); }, true);
-document.addEventListener("auxclick", (e) => { const h = getFlagged(e.target as Element); if (h) block(e, h.url); }, true);
+// Enter and Space on a focused link or button fire "click", so they're covered here too.
+document.addEventListener("click", (e) => { const h = checkBeforeClick(e); if (h) block(e, h.url); }, true);
+// Middle button only: the right button also fires auxclick, and contextmenu handles it.
+document.addEventListener("auxclick", (e) => {
+  if (e.button !== 1) return;
+  const h = checkBeforeClick(e);
+  if (h) block(e, h.url);
+}, true);
 document.addEventListener("contextmenu", (e) => {
-  const h = getFlagged(e.target as Element);
+  const h = checkBeforeClick(e);
   if (!h) return;
   e.preventDefault();
   window.alert(`Download trap: do not open this link.\nDestination: ${h.url}`);
-}, true);
-document.addEventListener("keydown", (e) => {
-  if (e.key !== "Enter" && e.key !== " ") return;
-  const h = getFlagged(e.target as Element);
-  if (h) block(e, h.url);
 }, true);
